@@ -3,7 +3,7 @@
 //
 // Layout: two fixed "stars" (masked holes, not evolved) sit side by side on
 // the x-axis, each wrapped in four curvilinear blocks covering one quadrant
-// of the annulus a < r < r_ann around it. A ninth curvilinear block bridges
+// of the annulus a < r < r_ann1 (r_ann2) around it. A ninth curvilinear
 // the gap between the two annuli across the L1 region:
 //
 //                 +-------+                 +-------+
@@ -17,8 +17,11 @@
 // Polar blocks (E1,N1,W1,S1 around star 1 at x = x1 < 0, E2,...,S2 around
 // star 2 at x = x2 > 0) use the StarDisk mapping translated to their star:
 //
-//   phi(i) = -pi/4 + (i/n_phi)*(pi/2),  rho(j) = a + (r_ann-a)*(j/n_r)^stretch
+//   phi(i) = -pi/4 + (i/n_phi)*(pi/2),  rho(j) = a + (r_annK-a)*(j/n_r)^stretch
 //   x = c + rho*(cos,sin)(theta_b + phi),   theta_b in {0, pi/2, pi, 3pi/2}
+//
+// with r_annK = r_ann1 (star 1) resp. r_ann2 (star 2); the radii may differ
+// so each star's Roche lobe can be contained (mandatory for q != 1).
 //
 // with logical (i = tangential CCW, j = radial). The bridge block is a Coons
 // (transfinite) patch with logical (i = along the arc, bottom -> top;
@@ -101,7 +104,8 @@ struct RocheParams {
     Real m2        = 1.0;   // mass of star 2 (at x2 > 0)
     Real sep       = 4.0;   // stellar separation D
     Real a         = 1.0;   // star radius (both stars)
-    Real r_ann     = 1.6;   // outer radius of each star's annulus mesh
+    Real r_ann1    = 1.6;   // outer radius of star 1's annulus mesh
+    Real r_ann2    = 1.6;   // outer radius of star 2's annulus mesh
     Real stretch   = 1.0;   // radial grading exponent (>1 clusters inward)
     Real cs        = 0.25;  // isothermal sound speed
     Real rho_l1    = 1.e-2; // IC density at L1 (sets the overcontact depth)
@@ -157,6 +161,15 @@ void derive (RocheParams& p) {
     }
     p.x_l1 = 0.5_rt * (lo + hi);
     p.phi_l1 = potential(p.x_l1, 0.0_rt, p);
+    // Geometry constraints: the annuli must not overlap, and the bridge
+    // corridor (x1 + r_ann1, x2 - r_ann2) must contain L1.
+    if (p.r_ann1 + p.r_ann2 >= p.sep) {
+        amrex::Abort("RocheBinary: r_ann1 + r_ann2 >= sep (annuli overlap)");
+    }
+    if (!(p.x1 + p.r_ann1 < p.x_l1 && p.x_l1 < p.x2 - p.r_ann2)) {
+        amrex::Abort("RocheBinary: L1 not inside the bridge corridor; "
+                     "adjust r_ann1/r_ann2");
+    }
 }
 
 enum class BlockKind { Polar, Bridge };
@@ -166,6 +179,7 @@ struct BlockGeom {
     Real cx      = 0.0;  // polar: x of star center
     Real cy      = 0.0;  // polar: y of star center
     Real theta_b = 0.0;  // polar: orientation angle
+    Real r_ann   = 1.6;  // polar: outer radius of this block's annulus
     bool jhi_seam = false;  // polar: j-high edge is a seam, not outflow
 };
 
@@ -177,7 +191,7 @@ GpuArray<Real, 2> vertex_pos (int i, int j, BlockGeom const& g,
         const Real dphi = (0.5_rt * M_PI) / p.n_phi;
         const Real phi  = -0.25_rt * M_PI + i * dphi;
         const Real s    = Real(j) / Real(p.n_r);
-        const Real rho  = p.a + (p.r_ann - p.a) * std::pow(s, p.stretch);
+        const Real rho  = p.a + (g.r_ann - p.a) * std::pow(s, p.stretch);
         const Real ang  = g.theta_b + phi;
         return {g.cx + rho * std::cos(ang), g.cy + rho * std::sin(ang)};
     }
@@ -187,16 +201,17 @@ GpuArray<Real, 2> vertex_pos (int i, int j, BlockGeom const& g,
     const Real t = Real(j) / Real(p.n_bridge);
     const Real thl = -0.25_rt * M_PI + s * (0.5_rt * M_PI);  // -45..45 deg
     const Real thr =  1.25_rt * M_PI - s * (0.5_rt * M_PI);  // 225..135 deg
-    const Real lx = p.x1 + p.r_ann * std::cos(thl);
-    const Real ly =        p.r_ann * std::sin(thl);
-    const Real rx = p.x2 + p.r_ann * std::cos(thr);
-    const Real ry =        p.r_ann * std::sin(thr);
+    const Real lx = p.x1 + p.r_ann1 * std::cos(thl);
+    const Real ly =        p.r_ann1 * std::sin(thl);
+    const Real rx = p.x2 + p.r_ann2 * std::cos(thr);
+    const Real ry =        p.r_ann2 * std::sin(thr);
     // Corners: A = L(0), B = L(1), C = R(1), D = R(0).
-    const Real cr = p.r_ann * 0.5_rt * std::sqrt(2.0_rt);  // r_ann * cos(45)
-    const Real ax = p.x1 + cr, ay = -cr;
-    const Real bx = p.x1 + cr, by =  cr;
-    const Real cx = p.x2 - cr, cy =  cr;
-    const Real dx = p.x2 - cr, dy = -cr;
+    const Real cr1 = p.r_ann1 * 0.5_rt * std::sqrt(2.0_rt);  // r_ann1 * cos(45)
+    const Real cr2 = p.r_ann2 * 0.5_rt * std::sqrt(2.0_rt);  // r_ann2 * cos(45)
+    const Real ax = p.x1 + cr1, ay = -cr1;
+    const Real bx = p.x1 + cr1, by =  cr1;
+    const Real cx = p.x2 - cr2, cy =  cr2;
+    const Real dx = p.x2 - cr2, dy = -cr2;
     // Straight bottom (A->D) and top (B->C) edges.
     const Real btm_x = (1.0_rt - t) * ax + t * dx;
     const Real btm_y = (1.0_rt - t) * ay + t * dy;
@@ -212,10 +227,15 @@ GpuArray<Real, 2> vertex_pos (int i, int j, BlockGeom const& g,
 }
 
 // Rusanov (local Lax-Friedrichs) flux for isothermal Euler across a face with
-// outward area vector (ax, ay). UL is the state inside, UR outside.
+// outward area vector (ax, ay). UL is the state inside, UR outside. The
+// dissipative term acts on the deviation from the initial equilibrium state
+// (U0L/U0R): in equilibrium the dissipation vanishes identically, so the
+// steep hydrostatic atmosphere is not eroded by numerical diffusion on long
+// times (well-balanced; plain-U dissipation evaporates the lobes in a few
+// sound times).
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-void rusanov_flux (Real const* UL, Real const* UR, Real ax, Real ay, Real cs,
-                   Real* F) {
+void rusanov_flux (Real const* UL, Real const* UR, Real const* U0L,
+                   Real const* U0R, Real ax, Real ay, Real cs, Real* F) {
     const Real area = std::sqrt(ax * ax + ay * ay);
     const Real nx = ax / area;
     const Real ny = ay / area;
@@ -226,11 +246,14 @@ void rusanov_flux (Real const* UL, Real const* UR, Real ax, Real ay, Real cs,
     const Real pR = cs * cs * rhoR;
     const Real smax = amrex::max(std::abs(unL), std::abs(unR)) + cs;
     F[URHO] = area * (0.5_rt * (rhoL * unL + rhoR * unR)
-                      - 0.5_rt * smax * (rhoR - rhoL));
+                      - 0.5_rt * smax * ((UR[URHO] - U0R[URHO])
+                                       - (UL[URHO] - U0L[URHO])));
     F[UMX]  = area * (0.5_rt * (UL[UMX] * unL + UR[UMX] * unR + (pL + pR) * nx)
-                      - 0.5_rt * smax * (UR[UMX] - UL[UMX]));
+                      - 0.5_rt * smax * ((UR[UMX] - U0R[UMX])
+                                       - (UL[UMX] - U0L[UMX])));
     F[UMY]  = area * (0.5_rt * (UL[UMY] * unL + UR[UMY] * unR + (pL + pR) * ny)
-                      - 0.5_rt * smax * (UR[UMY] - UL[UMY]));
+                      - 0.5_rt * smax * ((UR[UMY] - U0R[UMY])
+                                       - (UL[UMY] - U0L[UMY])));
 }
 
 class RocheBlock : public AmrCore {
@@ -287,7 +310,8 @@ class RocheBlock : public AmrCore {
                 u(i, j, k, UMY)  = 0.0_rt;
             });
         }
-        // Snapshot the initial state: it is the open-boundary reservoir.
+        // Interior of the reference state (its ghost cells are snapshot from
+        // U's pipeline-filled ghosts in MyMain -- see SnapshotInitGhosts).
         MultiFab::Copy(Uinit, U, 0, 0, ncomp, 0);
     }
 
@@ -378,6 +402,7 @@ class RocheBlock : public AmrCore {
         const RocheParams p = params;
         for (MFIter mfi(U, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
             Array4<Real const> u = U.const_array(mfi);
+            Array4<Real const> u0 = Uinit.const_array(mfi);
             Array4<Real> un = Unew.array(mfi);
             Array4<Real const> v = xyv.const_array(mfi);
             Array4<Real const> vol_a = vol.const_array(mfi);
@@ -397,24 +422,31 @@ class RocheBlock : public AmrCore {
 
                 Real UL[ncomp];
                 Real UR[ncomp];
+                Real ZL[ncomp];
+                Real ZR[ncomp];
                 Real F[ncomp];
                 Real fsum[ncomp] = {0.0_rt, 0.0_rt, 0.0_rt};
                 for (int n = 0; n < ncomp; ++n) { UL[n] = u(i, j, k, n); }
+                for (int n = 0; n < ncomp; ++n) { ZL[n] = u0(i, j, k, n); }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i - 1, j, k, n); }
-                rusanov_flux(UL, UR, Ailo[0], Ailo[1], p.cs, F);
+                for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i - 1, j, k, n); }
+                rusanov_flux(UL, UR, ZL, ZR, Ailo[0], Ailo[1], p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i + 1, j, k, n); }
-                rusanov_flux(UL, UR, Aihi[0], Aihi[1], p.cs, F);
+                for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i + 1, j, k, n); }
+                rusanov_flux(UL, UR, ZL, ZR, Aihi[0], Aihi[1], p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i, j - 1, k, n); }
-                rusanov_flux(UL, UR, Ajlo[0], Ajlo[1], p.cs, F);
+                for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i, j - 1, k, n); }
+                rusanov_flux(UL, UR, ZL, ZR, Ajlo[0], Ajlo[1], p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i, j + 1, k, n); }
-                rusanov_flux(UL, UR, Ajhi[0], Ajhi[1], p.cs, F);
+                for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i, j + 1, k, n); }
+                rusanov_flux(UL, UR, ZL, ZR, Ajhi[0], Ajhi[1], p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 const Real dtv = dt / vol_a(i, j, k);
@@ -459,6 +491,14 @@ class RocheBlock : public AmrCore {
     // Ghost cells shared between grids of this block (not needed at the
     // block's outer edges -- those are covered by seams and physical BCs).
     void FillGhosts() { U.FillBoundary(Geom(0).periodicity()); }
+
+    // Ghost cells of the reference state must be filled with the SAME rules
+    // as U's ghosts (seam copies, wall mirrors, reservoir copies) -- anything
+    // else (e.g. the analytic profile inside the star hole) makes the
+    // deviation U - U0 nonzero at boundary faces even in equilibrium, and the
+    // well-balanced dissipation turns into a mass pump. Call after the fill
+    // pipeline has run once on U at t = 0.
+    void SnapshotInitGhosts() { MultiFab::Copy(Uinit, U, 0, 0, ncomp, nghost); }
 
     // CFL-limited timestep for this block: V / sum_faces (|u.n| + cs) |A|.
     Real ComputeDt() const {
@@ -713,7 +753,7 @@ class RocheBlock : public AmrCore {
         if (level > 0) throw std::runtime_error("single-level only");
         U.define(ba, dm, ncomp, nghost);
         Unew.define(ba, dm, ncomp, nghost);
-        Uinit.define(ba, dm, ncomp, 0);
+        Uinit.define(ba, dm, ncomp, nghost);
         xyv.define(amrex::convert(ba, IntVect{AMREX_D_DECL(1, 1, 1)}), dm, 2, 0);
         vol.define(ba, dm, 1, 0);
     }
@@ -846,7 +886,8 @@ void MyMain() {
         pp.query("m2", p.m2);
         pp.query("sep", p.sep);
         pp.query("a", p.a);
-        pp.query("r_ann", p.r_ann);
+        pp.query("r_ann1", p.r_ann1);
+        pp.query("r_ann2", p.r_ann2);
         pp.query("stretch", p.stretch);
         pp.query("cs", p.cs);
         pp.query("rho_l1", p.rho_l1);
@@ -898,14 +939,14 @@ void MyMain() {
     AmrInfo amr_info{};
 
     // Star 1 (at x1) and star 2 (at x2), each with E, N, W, S blocks.
-    const BlockGeom g_e1{BlockKind::Polar, p.x1, 0.0_rt, 0.0_rt, /*jhi_seam=*/true};
-    const BlockGeom g_n1{BlockKind::Polar, p.x1, 0.0_rt, 0.5_rt * M_PI};
-    const BlockGeom g_w1{BlockKind::Polar, p.x1, 0.0_rt, 1.0_rt * M_PI};
-    const BlockGeom g_s1{BlockKind::Polar, p.x1, 0.0_rt, 1.5_rt * M_PI};
-    const BlockGeom g_e2{BlockKind::Polar, p.x2, 0.0_rt, 0.0_rt};
-    const BlockGeom g_n2{BlockKind::Polar, p.x2, 0.0_rt, 0.5_rt * M_PI};
-    const BlockGeom g_w2{BlockKind::Polar, p.x2, 0.0_rt, 1.0_rt * M_PI, /*jhi_seam=*/true};
-    const BlockGeom g_s2{BlockKind::Polar, p.x2, 0.0_rt, 1.5_rt * M_PI};
+    const BlockGeom g_e1{BlockKind::Polar, p.x1, 0.0_rt, 0.0_rt, p.r_ann1, /*jhi_seam=*/true};
+    const BlockGeom g_n1{BlockKind::Polar, p.x1, 0.0_rt, 0.5_rt * M_PI, p.r_ann1};
+    const BlockGeom g_w1{BlockKind::Polar, p.x1, 0.0_rt, 1.0_rt * M_PI, p.r_ann1};
+    const BlockGeom g_s1{BlockKind::Polar, p.x1, 0.0_rt, 1.5_rt * M_PI, p.r_ann1};
+    const BlockGeom g_e2{BlockKind::Polar, p.x2, 0.0_rt, 0.0_rt, p.r_ann2};
+    const BlockGeom g_n2{BlockKind::Polar, p.x2, 0.0_rt, 0.5_rt * M_PI, p.r_ann2};
+    const BlockGeom g_w2{BlockKind::Polar, p.x2, 0.0_rt, 1.0_rt * M_PI, p.r_ann2, /*jhi_seam=*/true};
+    const BlockGeom g_s2{BlockKind::Polar, p.x2, 0.0_rt, 1.5_rt * M_PI, p.r_ann2};
     const BlockGeom g_br{BlockKind::Bridge, 0.0_rt, 0.0_rt, 0.0_rt};
 
     RocheBlock e1(g_e1, make_geom(g_e1, domain_polar), p, amr_info);
@@ -919,11 +960,13 @@ void MyMain() {
     RocheBlock br(g_br, make_geom(g_br, domain_bridge), p, amr_info);
 
     // Geometry report: per-block bounding box and volume. Each polar block
-    // is a quarter annulus of area pi (r_ann^2 - a^2) / 4.
+    // is a quarter annulus of area pi (r_annK^2 - a^2) / 4.
     {
-        const Real vol_an = M_PI * (p.r_ann * p.r_ann - p.a * p.a) / 4.0_rt;
+        const Real vol_an1 = M_PI * (p.r_ann1 * p.r_ann1 - p.a * p.a) / 4.0_rt;
+        const Real vol_an2 = M_PI * (p.r_ann2 * p.r_ann2 - p.a * p.a) / 4.0_rt;
         amrex::Print().SetPrecision(10)
-            << "Polar block volume (analytic): " << vol_an << '\n';
+            << "Polar block volume (analytic): " << vol_an1
+            << " (star 1), " << vol_an2 << " (star 2)\n";
         RocheBlock* all[9] = {&e1, &n1, &w1, &s1, &e2, &n2, &w2, &s2, &br};
         const char* names[9] = {"e1", "n1", "w1", "s1", "e2", "n2", "w2", "s2", "br"};
         for (int b = 0; b < 9; ++b) {
@@ -1026,6 +1069,16 @@ void MyMain() {
         << ", bridge " << rm0[2] << ")\n";
 
     for (int b = 0; b < 9; ++b) WritePlotfile(*blocks[b], names[b], t, step);
+
+    // Establish U's t=0 ghost state with the production fill pipeline, then
+    // snapshot interior + ghosts as the static reference U0. With U0's
+    // ghosts filled by the same rules as U's, the deviation U - U0 is zero
+    // at every face in equilibrium and the well-balanced dissipation
+    // vanishes identically.
+    for (auto* b : blocks) b->FillGhosts();
+    FillSeams();
+    for (auto* b : blocks) b->FillPhysicalBCs();
+    for (auto* b : blocks) b->SnapshotInitGhosts();
 
     // Optional poison test: NaN-poison all ghost cells, run the full fill
     // pipeline once, and require every face-adjacent ghost cell to be filled.
