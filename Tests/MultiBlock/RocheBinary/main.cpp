@@ -60,6 +60,14 @@
 // force launches shocks and the circulation brakes back to corotation over
 // ~10 orbits. This is not a discrete equilibrium, so run it with
 // outer_bc=closed (the reservoir would pin the open edges to counter-rotation).
+// roche.drive_eps > 0 enables a driven donor (setup D): the donor (xc < x_l1)
+// density relaxes toward (1+eps(t))*rho_eq, where eps(t) ramps linearly 0 ->
+// drive_eps over drive_tau (<=0 -> one orbital period). The injected gas is
+// at rest in the corotating frame, so the donor's envelope inflates and
+// drives sustained L1 mass transfer that tracks the ramp with lag ~drive_tau.
+// The system never settles -- it walks through quasi-steady transfer states.
+// Mass is added to lobe 1 at a controlled rate, so total mass drifts upward
+// (do-not-break #8 is about the UNDRIVEN case).
 //
 // Boundary conditions: reflecting wall at each star surface (polar j-low).
 // Open edges (polar j-high, bridge i-edges) use a far-field reservoir: ghost
@@ -144,6 +152,18 @@ struct RocheParams {
                             //    over ~10 orbits. Not a discrete equilibrium:
                             //    run with outer_bc=closed (the reservoir would
                             //    pin the boundary to the counter-rotating state).
+    Real drive_eps = 0.0;   // Setup D: donor envelope inflation amplitude.
+                            //    When >0 the donor (xc < x_l1) rho relaxes
+                            //    toward (1+eps(t))*rho_eq, eps ramping 0 ->
+                            //    drive_eps over drive_tau. Mimics donor
+                            //    expansion; mass is added to lobe 1 at a
+                            //    controlled rate, driving sustained L1 mass
+                            //    transfer that tracks the ramp. Default 0
+                            //    -> bitwise unchanged.
+    Real drive_tau = 0.0;   // Setup D ramp + relaxation timescale. <=0 -> one
+                            //    orbital period (2*pi/omega). The relaxation
+                            //    rate is 1/drive_tau so the donor density
+                            //    tracks the inflated target with lag ~drive_tau.
     int  n_phi     = 64;    // tangential cells per polar block (= bridge i)
     int  n_r       = 64;    // radial cells per polar block
     int  n_bridge  = 64;    // bridge cells along the corridor axis (j)
@@ -524,7 +544,7 @@ class RocheBlock : public AmrCore {
 
     // One explicit Euler step: Rusanov fluxes through the four curvilinear
     // faces plus the Roche-potential and Coriolis sources.
-    void Advance(Real dt) {
+    void Advance(Real t, Real dt) {
         const RocheParams p = params;
         for (MFIter mfi(U, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
             Array4<Real const> u = U.const_array(mfi);
@@ -620,6 +640,32 @@ class RocheBlock : public AmrCore {
                         const Real fac = p.vmax / vmag;
                         mx_new *= fac;
                         my_new *= fac;
+                    }
+                }
+
+                // Driven donor (setup D): Newtonian relaxation of the donor
+                // (xc < x_l1) density toward an inflated target
+                // (1+eps(t))*rho_eq, where eps(t) is a linear ramp 0 ->
+                // drive_eps over drive_tau and rho_eq is the original
+                // hydrostatic atmosphere. Mass is added to lobe 1 at a
+                // controlled rate (the injected gas is at rest in the
+                // corotating frame, so no momentum source), driving sustained
+                // L1 mass transfer whose flux tracks the ramp with lag
+                // ~drive_tau. Off when drive_eps = 0 (default) -> unchanged.
+                if (p.drive_eps > 0.0_rt) {
+                    const Real tau = (p.drive_tau > 0.0_rt)
+                        ? p.drive_tau : 2.0_rt * M_PI / p.omega;
+                    if (xc < p.x_l1) {
+                        const Real eps = p.drive_eps
+                            * amrex::min(1.0_rt, t / tau);
+                        const Real phi = potential(xc, yc, p);
+                        const Real rho_eq = amrex::max(
+                            p.rho_l1 * std::exp(-(phi - p.phi_l1)
+                                                / (p.cs * p.cs)),
+                            p.rho_floor);
+                        rho_new += dt * ((1.0_rt + eps) * rho_eq - rho_new)
+                                 / tau;
+                        rho_new = amrex::max(rho_new, p.rho_floor);
                     }
                 }
 
@@ -1111,6 +1157,8 @@ void MyMain() {
             amrex::Abort("roche.outer_bc must be 'reservoir' or 'closed'");
         }
         pp.query("counter_rotate", p.counter_rotate);
+        pp.query("drive_eps", p.drive_eps);
+        pp.query("drive_tau", p.drive_tau);
     }
     derive(p);
     amrex::Print().SetPrecision(10)
@@ -1135,6 +1183,13 @@ void MyMain() {
     if (p.counter_rotate) {
         amrex::Print() << "IC: gas at inertial rest -- counter-rotating at "
                           "omega*(y,-x); use outer_bc=closed\n";
+    }
+    if (p.drive_eps > 0.0_rt) {
+        const Real tau = (p.drive_tau > 0.0_rt)
+            ? p.drive_tau : 2.0_rt * M_PI / p.omega;
+        amrex::Print().SetPrecision(8)
+            << "Driven donor (setup D): rho relaxes toward (1+" << p.drive_eps
+            << ")*rho_eq on lobe 1 over tau = " << tau << '\n';
     }
 
     // Polar blocks share one logical domain box; the bridge has its own.
@@ -1354,7 +1409,7 @@ void MyMain() {
         for (auto* b : blocks) b->FillGhosts();
         FillSeams();
         for (auto* b : blocks) b->FillPhysicalBCs();
-        for (auto* b : blocks) b->Advance(dt);
+        for (auto* b : blocks) b->Advance(t, dt);
         t += dt;
         ++step;
 
