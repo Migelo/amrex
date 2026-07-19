@@ -1,27 +1,28 @@
 // 2D star + accretion disk example using AMReX NonLocalBC on a multi-block
 // curvilinear grid.
 //
-// Layout: a fixed "star" occupies the central square [-a,a]^2 (masked, not
-// evolved). Four identical blocks surround it, each covering one sector of an
-// annulus between the square's edge and an outer circle of radius r_out:
+// Layout: a fixed "star" occupies the central disk r < a (masked, not
+// evolved). Four identical blocks surround it, each covering one quadrant
+// of the circular annulus a < r < r_out:
 //
 //                 +-------+
 //                 |   N   |
-//         +-------+-------+-------+
-//         |   W   | star  |   E   |
-//         +-------+-------+-------+
+//         +-------+ .---. +-------+
+//         |   W   |( star )   E   |
+//         +-------+ '---' +-------+
 //                 |   S   |
 //                 +-------+
 //
 // Each block has logical coordinates (i = tangential, counterclockwise;
 // j = radial, outward) and is mapped to physical space by
 //
-//   phi(i)   = -pi/4 + (i/n_phi)*(pi/2)          (angle relative to block)
-//   r_in(phi) = a / cos(phi)                     (inner square edge)
-//   rho(j,phi) = r_in(phi) + (r_out - r_in(phi)) * (j/n_r)^stretch
+//   phi(i)    = -pi/4 + (i/n_phi)*(pi/2)         (angle relative to block)
+//   rho(j)    = a + (r_out - a) * (j/n_r)^stretch
 //   x = rho * cos(theta_b + phi),  y = rho * sin(theta_b + phi)
 //
 // with block orientation theta_b in {0, pi/2, pi, 3 pi/2} for E, N, W, S.
+// Each block is a polar sector; the inner edge of the annulus is the circle
+// r = a (the star surface).
 //
 // The four tangential seams (E<->N, N<->W, W<->S, S<->E) are glued with
 // aligned (offset-only) MultiBlockIndexMapping fills, so the disk annulus is
@@ -79,7 +80,7 @@ constexpr int nghost = 1;          // first-order: one ghost layer
 enum idirs { ix, iy };
 
 struct DiskParams {
-    Real a         = 1.0;   // half side length of the central star square
+    Real a         = 1.0;   // star radius (inner disk boundary r = a)
     Real r_out     = 4.0;   // outer disk radius
     Real stretch   = 1.0;   // radial grading exponent (>1 clusters cells inward)
     Real gm        = 1.0;   // point mass of the star
@@ -99,8 +100,7 @@ GpuArray<Real, 2> vertex_pos (int i, int j, Real theta_b, DiskParams const& p) {
     const Real dphi = (0.5_rt * M_PI) / p.n_phi;
     const Real phi  = -0.25_rt * M_PI + i * dphi;
     const Real s    = Real(j) / Real(p.n_r);
-    const Real r_in = p.a / std::cos(phi);
-    const Real rho  = r_in + (p.r_out - r_in) * std::pow(s, p.stretch);
+    const Real rho  = p.a + (p.r_out - p.a) * std::pow(s, p.stretch);
     const Real ang  = theta_b + phi;
     return {rho * std::cos(ang), rho * std::sin(ang)};
 }
