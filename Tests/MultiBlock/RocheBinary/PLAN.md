@@ -192,12 +192,50 @@ in main.cpp unless noted; run 20 orbits (~12-15 min wall) via run_roche_video.sh
   flux envelope ~ a few orbits; the residual circulation is long-lived.
 - Published: ~/stardisk-site/differential_{rho,flux,lobes,drift}.png + site section.
 
-### C. Counter-rotating start (inertial-rest gas)
-- IC: mom = rho * omega * (y, -x) instead of 0 (one line). Mach ~2 at the
-  outer edge initially: strong shocks early (dt dips, cost ~2x), circulation
-  brakes and re-corotates over ~10 orbits.
+### C. Counter-rotating start (inertial-rest gas) &mdash; DONE (2026-07-19)
+- IC: mom = rho * omega * (y, -x) instead of 0 (one line in InitData). Mach
+  ~3.5 at the outer edge initially: strong shocks early, circulation brakes
+  and re-corotates over ~10 orbits.
 - Acceptance: max|v| peaks early then decays; by t ~ 10 orbits the mean flow
   is ~corotating (|v| ~ sloshing level, no systematic counter-rotation).
+- RESULT (q=1, cs=0.25, stop_time=350 ~ 10 orbits): new key `roche.counter_rotate`
+  (int, default 0). When set, InitData gives the gas solid-body counter-rotation
+  v = omega*(y,-x) (inertial rest seen in the corotating frame); else branch is
+  the old mom=0 path, so default IC is bitwise unchanged. Run with
+  `outer_bc=closed` (counter-rotation is not a discrete equilibrium; the
+  reservoir would pin the open edges to counter-rotation -- the setup-B lesson)
+  and `vmax=2.0` (caps low-density vacuum jets during the violent transient; the
+  overcontact min rho ~0.002 drops toward floor as the counter-rotating gas
+  dynamically rarefies, and uncapped v=mom/rho runs to 1e9 in <500 steps and
+  collapses dt). Added a mass-weighted bulk speed diagnostic
+  (BulkSpeedMoments -> diagnostics.dat column `bulk_v`, printed as `bulk|v|`)
+  because max|v| is dominated by a few tenuous jet cells and hides the bulk
+  braking. New plot script `plot_counter_braking.py` (bulk/max|v| + drift vs
+  orbits).
+- **CRITICAL (well-balanced reference):** SnapshotInitGhosts copies U (the
+  counter-rotating IC, u != 0) into U0 by default. With U0_mom = counter-
+  rotating, the Rusanov dissipation acts on (U-U0) and *vanishes* wherever the
+  gas counter-rotates -- the strong shear v=omega*r then has no numerical
+  dissipation (a central scheme) and goes unstable: v -> 1e9 in <500 steps.
+  Fix: when counter_rotate is set, SnapshotInitGhosts zeros U0's momentum
+  (`Uinit.setVal(0, UMX, 2, nghost)`), so the reference is the hydrostatic
+  atmosphere AT REST. Density dissipation still protects the steep profile
+  (acts on rho-rho_eq); momentum dissipation acts on the full field (standard
+  Rusanov on momentum), which stabilizes the shear and brakes the counter-
+  rotation on the diffusion timescale R^2/(smax*dx) ~ 290 ~ 8 orbits. Lesson:
+  **the well-balanced reference is the EQUILIBRIUM atmosphere (u=0); a flowing
+  non-equilibrium U0 turns off the dissipation on its own shear and is unstable.**
+- Verified: poison 0 unfilled (2 ranks), step-1 mass drift -8.2e-16 (exact,
+  closed walls), 4 MultiBlock ctests pass (default IC bitwise unchanged), DEBUG
+  5-step clean (-ftrapv/-ffpe-trap, 0 NaN), 0 NaN over 100,500 steps to t=350.
+  bulk|v| decays 0.368 -> 0.031 (~12x, to sloshing level ~cs/8) by ~10 orbits;
+  max|v| capped at 2.0 during the t<30 transient then releases, settling near
+  cs=0.25; mass drift plateaus at 0.25% (closed, mass-conservative cap); 180deg
+  point symmetry throughout (e1<->w2, n1<->s2). Vision oracle: clean rho panel,
+  no seam artifacts. Published ~/stardisk-site/counter_rot.mp4 (67 frames) +
+  counter_rot_rho.png + counter_braking.png + site section. NOTE: a fully clean
+  "max|v| -> sloshing" is not reached (worst tenuous cell stays ~cs); the BULK
+  flow is the honest corotation metric and it does brake to sloshing.
 
 ### D. Driven donor (slow envelope expansion) — needs a source term (~15 lines)
 - Add to Advance: relaxation of lobe-1 rho toward (1+eps(t)) * equilibrium,

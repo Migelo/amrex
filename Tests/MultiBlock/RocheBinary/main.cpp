@@ -54,6 +54,12 @@
 // (x >= x_l1) at the floor: the L1-plane discontinuity is then the initial
 // condition, modelling a semi-detached binary in which only the donor fills
 // its Roche lobe (the mass-transfer stream is born at L1).
+// roche.counter_rotate=1 overrides the rest condition: the gas starts at
+// inertial rest, which in the corotating frame is solid-body counter-rotation
+// v = omega*(y,-x) (Mach ~3.5 at the outer edge). The unbalanced Coriolis
+// force launches shocks and the circulation brakes back to corotation over
+// ~10 orbits. This is not a discrete equilibrium, so run it with
+// outer_bc=closed (the reservoir would pin the open edges to counter-rotation).
 //
 // Boundary conditions: reflecting wall at each star surface (polar j-low).
 // Open edges (polar j-high, bridge i-edges) use a far-field reservoir: ghost
@@ -131,6 +137,13 @@ struct RocheParams {
     int  ic_mode   = IC_OVERCONTACT;  // IC_OVERCONTACT | IC_SEMI_DETACHED
     int  outer_closed = 0;  // 1: reflecting wall at outer edges (closed system
                             //    for the differential-depth IC, else reservoir)
+    int  counter_rotate = 0;// 1: IC gas at inertial rest, which in the corotating
+                            //    frame is solid-body counter-rotation v = omega*
+                            //    (y,-x); the unbalanced Coriolis force drives
+                            //    shocks and the circulation brakes to corotation
+                            //    over ~10 orbits. Not a discrete equilibrium:
+                            //    run with outer_bc=closed (the reservoir would
+                            //    pin the boundary to the counter-rotating state).
     int  n_phi     = 64;    // tangential cells per polar block (= bridge i)
     int  n_r       = 64;    // radial cells per polar block
     int  n_bridge  = 64;    // bridge cells along the corridor axis (j)
@@ -374,8 +387,16 @@ class RocheBlock : public AmrCore {
                     }
                 }
                 u(i, j, k, URHO) = rho;
-                u(i, j, k, UMX)  = 0.0_rt;
-                u(i, j, k, UMY)  = 0.0_rt;
+                if (p.counter_rotate) {
+                    // Inertial-rest gas seen in the corotating frame: solid-
+                    // body counter-rotation v = -Omega z x r = omega*(y, -x).
+                    // Mach ~ omega*r/cs, so ~3.5 at the outer edge initially.
+                    u(i, j, k, UMX) = rho * p.omega * yc;
+                    u(i, j, k, UMY) = -rho * p.omega * xc;
+                } else {
+                    u(i, j, k, UMX) = 0.0_rt;
+                    u(i, j, k, UMY) = 0.0_rt;
+                }
             });
         }
         // Interior of the reference state (its ghost cells are snapshot from
@@ -620,7 +641,21 @@ class RocheBlock : public AmrCore {
     // deviation U - U0 nonzero at boundary faces even in equilibrium, and the
     // well-balanced dissipation turns into a mass pump. Call after the fill
     // pipeline has run once on U at t = 0.
-    void SnapshotInitGhosts() { MultiFab::Copy(Uinit, U, 0, 0, ncomp, nghost); }
+    void SnapshotInitGhosts() {
+        MultiFab::Copy(Uinit, U, 0, 0, ncomp, nghost);
+        if (params.counter_rotate) {
+            // The well-balanced reference is the hydrostatic atmosphere AT
+            // REST, not the counter-rotating IC. Zero the reference momentum
+            // so the Rusanov dissipation acts on the full momentum field:
+            // the counter-rotating shear v = omega*r is strong, and a
+            // dissipation that vanishes on it is a central scheme that goes
+            // unstable (velocity runaway to 1e9 in <500 steps). The density
+            // reference is unchanged, so the steep atmosphere is still
+            // protected. Standard-Rusanov momentum diffusion then brakes the
+            // counter-rotation over ~8 orbits (R^2/(smax*dx) ~ 290).
+            Uinit.setVal(0.0_rt, UMX, 2, nghost);
+        }
+    }
 
     // CFL-limited timestep for this block: V / sum_faces (|u.n| + cs) |A|.
     Real ComputeDt() const {
@@ -702,6 +737,34 @@ class RocheBlock : public AmrCore {
         Real v = amrex::get<0>(reduce_data.value());
         ParallelDescriptor::ReduceRealMax(v);
         return v;
+    }
+    // Mass-weighted speed moments for this block: (sum rho*|u|*vol,
+    // sum rho*vol). The ratio, reduced over all blocks, is the bulk flow
+    // speed -- the honest "is the gas corotating?" metric. max|v| is
+    // dominated by a few tenuous jet cells; the bulk speed tracks the mean.
+    std::pair<Real, Real> BulkSpeedMoments() const {
+        ReduceOps<ReduceOpSum, ReduceOpSum> reduce_op;
+        ReduceData<Real, Real> reduce_data(reduce_op);
+        using ReduceTuple = typename decltype(reduce_data)::Type;
+        for (MFIter mfi(U); mfi.isValid(); ++mfi) {
+            const Box& vbx = mfi.validbox();
+            Array4<Real const> u = U.const_array(mfi);
+            Array4<Real const> vol_a = vol.const_array(mfi);
+            reduce_op.eval(vbx, reduce_data,
+                           [=] AMREX_GPU_DEVICE(int i, int j, int k) -> ReduceTuple {
+                const Real rho = u(i, j, k, URHO);
+                const Real mx = u(i, j, k, UMX);
+                const Real my = u(i, j, k, UMY);
+                const Real vmag = std::sqrt(mx * mx + my * my) / rho;
+                return {rho * vmag * vol_a(i, j, k), rho * vol_a(i, j, k)};
+            });
+        }
+        const auto r = reduce_data.value();
+        Real num = amrex::get<0>(r);
+        Real den = amrex::get<1>(r);
+        ParallelDescriptor::ReduceRealSum(num);
+        ParallelDescriptor::ReduceRealSum(den);
+        return {num, den};
     }
 
     // Number of NaN density cells in this block (MPI_SUM-safe, unlike
@@ -1047,6 +1110,7 @@ void MyMain() {
         } else {
             amrex::Abort("roche.outer_bc must be 'reservoir' or 'closed'");
         }
+        pp.query("counter_rotate", p.counter_rotate);
     }
     derive(p);
     amrex::Print().SetPrecision(10)
@@ -1067,6 +1131,10 @@ void MyMain() {
     }
     if (p.outer_closed) {
         amrex::Print() << "Outer boundary: closed (reflecting walls)\n";
+    }
+    if (p.counter_rotate) {
+        amrex::Print() << "IC: gas at inertial rest -- counter-rotating at "
+                          "omega*(y,-x); use outer_bc=closed\n";
     }
 
     // Polar blocks share one logical domain box; the bridge has its own.
@@ -1260,18 +1328,19 @@ void MyMain() {
     std::ofstream diag;
     if (ParallelDescriptor::IOProcessor()) {
         diag.open("RocheBinary/diagnostics.dat", std::ios::out);
-        diag << "# step t dt mass_drift m_lobe1 m_bridge m_lobe2 l1_flux max_v\n";
+        diag << "# step t dt mass_drift m_lobe1 m_bridge m_lobe2 l1_flux max_v bulk_v\n";
     }
     auto write_diag = [&](int s, Real tt, Real dtt, Real mdrift, Real ml1,
-                          Real mbr, Real ml2, Real flux, Real mxv) {
+                          Real mbr, Real ml2, Real flux, Real mxv, Real bvv) {
         if (ParallelDescriptor::IOProcessor()) {
             diag << s << ' ' << std::scientific << std::setprecision(12)
                  << tt << ' ' << dtt << ' ' << mdrift << ' ' << ml1 << ' '
-                 << mbr << ' ' << ml2 << ' ' << flux << ' ' << mxv << '\n';
+                 << mbr << ' ' << ml2 << ' ' << flux << ' ' << mxv << ' '
+                 << bvv << '\n';
             diag.flush();
         }
     };
-    write_diag(0, 0.0_rt, 0.0_rt, 0.0_rt, rm0[0], rm0[2], rm0[1], 0.0_rt, 0.0_rt);
+    write_diag(0, 0.0_rt, 0.0_rt, 0.0_rt, rm0[0], rm0[2], rm0[1], 0.0_rt, 0.0_rt, 0.0_rt);
 
     while (t < stop_time && step < max_steps) {
         Real dt = blocks[0]->ComputeDt();
@@ -1290,11 +1359,14 @@ void MyMain() {
         ++step;
 
         if (step % print_int == 0) {
-            Real mass = 0.0_rt, maxv = 0.0_rt;
+            Real mass = 0.0_rt, maxv = 0.0_rt, bnum = 0.0_rt, bden = 0.0_rt;
             for (auto* b : blocks) {
                 mass += b->TotalMass();
                 maxv = amrex::max(maxv, b->MaxVel());
+                const auto [n, d] = b->BulkSpeedMoments();
+                bnum += n; bden += d;
             }
+            const Real bulk_v = (bden > 0.0_rt) ? bnum / bden : 0.0_rt;
             const auto rm = region_mass();
             const Real l1_flux = br.MidplaneFlux();
             amrex::Print().SetPrecision(10)
@@ -1303,9 +1375,10 @@ void MyMain() {
                 << ", m_lobe1 = " << rm[0] << ", m_bridge = " << rm[2]
                 << ", m_lobe2 = " << rm[1]
                 << ", L1 flux = " << l1_flux
-                << ", max|v| = " << maxv << '\n';
+                << ", max|v| = " << maxv
+                << ", bulk|v| = " << bulk_v << '\n';
             write_diag(step, t, dt, (mass - mass0) / mass0,
-                       rm[0], rm[2], rm[1], l1_flux, maxv);
+                       rm[0], rm[2], rm[1], l1_flux, maxv, bulk_v);
             for (int b = 0; b < 9; ++b) {
                 const auto [rlo, rhi] = blocks[b]->RhoMinMax();
                 amrex::Print().SetPrecision(10)
