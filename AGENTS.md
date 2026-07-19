@@ -105,6 +105,7 @@ Adapt the `Tests/MultiBlock/AdvectionThree` setup (commit `31602db9c`) into a 2D
 - Executables: `main2d.gnu.MPI.ex` (opt) and `main2d.gnu.DEBUG.MPI.ex` (built with `DEBUG=TRUE`).
 - Run: `direnv exec . mpirun -n 2 ./main2d.gnu.MPI.ex disk.max_steps=1 disk.print_int=1 disk.plot_int=1000000` (ParmParse overrides work; see fixed bug #4).
 - ctest: one-time configure `direnv exec . cmake -S . -B build -DAMReX_SPACEDIM=2 -DAMReX_ENABLE_TESTS=ON -DAMReX_TEST_TYPE=All` (2D required for StarDisk/RocheBinary), then `direnv exec . ctest --test-dir build -R MultiBlock --output-on-failure`. New test dirs under Tests/MultiBlock are auto-registered via GLOB_RECURSE, but only after re-running cmake configure.
+- Video pipeline: `cd Tests/MultiBlock/RocheBinary && ./run_roche_video.sh OUTNAME roche.key=value ...` runs the sim in an isolated `video_runs/OUTNAME/` workdir, renders one rho frame per plotfile step (render_frames.py, star masks auto-derived from m1/m2/sep/a), encodes h264 via system ffmpeg (env knobs FPS, CRF), and publishes to `~/stardisk-site/OUTNAME.mp4`. Verified end-to-end with q=0.5 (`roche.m2=0.5`): masks land on the asymmetric star positions (x=-1.333, +2.667).
 
 ### The test: `Tests/MultiBlock/StarDisk/` (committed)
 
@@ -158,7 +159,7 @@ Key design points: 20 one-sided seam fills = 16 tangential (offset-only, as Star
 
 ### Web server (rho panel viewer, 2026-07-19)
 
-Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
+Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift) + `roche_evolution.mp4` (64-frame video of the perturb=0.05 run to t=4, embedded in the RocheBinary section) + `m2_05.mp4` (q=0.5 pipeline demo). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
 
 - tailnet: http://100.67.152.108:8000 (machine `blu`)
 - LAN: http://178.254.33.110:8000
