@@ -100,9 +100,11 @@ Adapt the `Tests/MultiBlock/AdvectionThree` setup (commit `31602db9c`) into a 2D
 ### Environment
 
 - No system compiler on this NixOS workstation. `shell.nix` + `.envrc` at repo root (tracked since `5ca8de56`; only `.direnv/` is untracked) provide gcc 15.2, gfortran, openmpi 5.0.10, cmake, python3 via direnv.
-- Build: `cd Tests/MultiBlock/StarDisk && direnv exec . make -j4` (~2 min from clean).
+- **Weak VPS: build with max 2 cores (`make -j2`), run with max 2 MPI ranks** (user directive 2026-07-19).
+- Build: `cd Tests/MultiBlock/StarDisk && direnv exec . make -j2` (~2 min from clean; ~4.5 min for `DEBUG=TRUE`).
 - Executables: `main2d.gnu.MPI.ex` (opt) and `main2d.gnu.DEBUG.MPI.ex` (built with `DEBUG=TRUE`).
-- Run: `mpirun -n 2 ./main2d.gnu.MPI.ex disk.max_steps=1 disk.print_int=1 disk.plot_int=1000000` (ParmParse overrides work; see fixed bug #4).
+- Run: `direnv exec . mpirun -n 2 ./main2d.gnu.MPI.ex disk.max_steps=1 disk.print_int=1 disk.plot_int=1000000` (ParmParse overrides work; see fixed bug #4).
+- ctest: one-time configure `direnv exec . cmake -S . -B build -DAMReX_SPACEDIM=2 -DAMReX_ENABLE_TESTS=ON -DAMReX_TEST_TYPE=All` (2D required for StarDisk/RocheBinary), then `direnv exec . ctest --test-dir build -R MultiBlock --output-on-failure`. New test dirs under Tests/MultiBlock are auto-registered via GLOB_RECURSE, but only after re-running cmake configure.
 
 ### The test: `Tests/MultiBlock/StarDisk/` (committed)
 
@@ -154,9 +156,9 @@ Key design points: 20 one-sided seam fills = 16 tangential (offset-only, as Star
 2. **FillPhysicalBCs overwrote seam-filled ghosts**: loop order FillGhosts -> FillSeams -> FillPhysicalBCs (StarDisk idiom) is only safe if BC edges and seam edges are disjoint. e1/w2 j-hi are seams (bridge), but the inherited polar j-hi zero-gradient BC overwrote the seam-filled ghosts -> one-sided flux across the seam -> +2.95e-6 mass/step created in the bridge. Fix: per-edge seam flag in BlockGeom, BCs skip seam edges. **Lesson: when adding seams to an existing block layout, audit every BC edge for overlap.**
 3. **Zero-gradient outflow runaway in a tenuous hydrostatic atmosphere**: ghost copies of the interior let the discretely-imbalanced boundary shell collapse inward and the BC chases it: +25% mass and Mach>4 tenuous gas by t=4, dt collapsing. Fix: far-field reservoir BC (ghost = initial equilibrium state stored in Uinit) -> exchange driven only by genuine interior relaxation; drift -0.08%/t=4, bounded velocities. **Lesson: zero-gradient outflow is unsafe for steep stratified atmospheres; pin the boundary to equilibrium or use a reservoir.**
 
-### Web server (stardisk_rho.png viewer, 2026-07-19)
+### Web server (rho panel viewer, 2026-07-19)
 
-Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, rho panels + caption) + copy of `stardisk_rho.png`. Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
+Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
 
 - tailnet: http://100.67.152.108:8000 (machine `blu`)
 - LAN: http://178.254.33.110:8000
