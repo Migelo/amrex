@@ -165,7 +165,7 @@ Key design points: 20 one-sided seam fills = 16 tangential (offset-only, as Star
 
 ### Web server (rho panel viewer, 2026-07-19)
 
-Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift) + `roche_evolution.mp4` (64-frame video of the perturb=0.05 run to t=4, embedded in the RocheBinary section) + `m2_05.mp4` (q=0.5 pipeline demo). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
+Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift) + `roche_evolution.mp4` (64-frame video of the perturb=0.05 run to t=4, embedded in the RocheBinary section) + `m2_05.mp4` (q=0.5 pipeline demo) + `bug_showcase.png` (bring-up failure modes vs fixed scheme, q=2 20-orbit work) + `q2_20orb.mp4` (20-orbit q=2 video, 568 frames). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
 
 - tailnet: http://100.67.152.108:8000 (machine `blu`)
 - LAN: http://178.254.33.110:8000
