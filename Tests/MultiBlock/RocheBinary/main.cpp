@@ -49,7 +49,11 @@
 // Roche potential, rho = rho_l1 * exp(-(Phi - Phi_L1)/cs^2) (floored), at
 // rest in the corotating frame: an overcontact (common-envelope) configura-
 // tion with a gas bridge through L1. roche.perturb boosts the density on the
-// star-1 side to drive mass transfer through the bridge.
+// star-1 side to drive mass transfer through the bridge. Setting
+// roche.ic_mode = "semi_detached" instead leaves the accretor side
+// (x >= x_l1) at the floor: the L1-plane discontinuity is then the initial
+// condition, modelling a semi-detached binary in which only the donor fills
+// its Roche lobe (the mass-transfer stream is born at L1).
 //
 // Boundary conditions: reflecting wall at each star surface (polar j-low).
 // Open edges (polar j-high, bridge i-edges) use a far-field reservoir: ghost
@@ -73,6 +77,7 @@
 
 #include <cmath>
 #include <limits>
+#include <string>
 
 static_assert(AMREX_SPACEDIM == 2, "RocheBinary is a 2D-only test");
 
@@ -99,6 +104,10 @@ constexpr int nghost = 1;          // first-order: one ghost layer
 
 enum idirs { ix, iy };
 
+// Initial-condition mode (host-parsed from roche.ic_mode into this int, since
+// RocheParams is copied by value into device lambdas and cannot hold a string).
+enum IcMode { IC_OVERCONTACT = 0, IC_SEMI_DETACHED = 1 };
+
 struct RocheParams {
     Real m1        = 1.0;   // mass of star 1 (at x1 < 0)
     Real m2        = 1.0;   // mass of star 2 (at x2 > 0)
@@ -112,7 +121,9 @@ struct RocheParams {
     Real rho_floor = 1.e-8;
     Real soft      = 0.0;   // gravitational softening length
     Real cfl       = 0.5;
+    Real vmax      = 0.0;   // >0 caps |v| (semi-detached vacuum-jet fix)
     Real perturb   = 0.0;   // relative density boost on the star-1 side
+    int  ic_mode   = IC_OVERCONTACT;  // IC_OVERCONTACT | IC_SEMI_DETACHED
     int  n_phi     = 64;    // tangential cells per polar block (= bridge i)
     int  n_r       = 64;    // radial cells per polar block
     int  n_bridge  = 64;    // bridge cells along the corridor axis (j)
@@ -299,11 +310,18 @@ class RocheBlock : public AmrCore {
                 // Hydrostatic isothermal atmosphere in the Roche potential,
                 // normalized to rho_l1 at L1; at rest in the corotating frame.
                 const Real phi = potential(xc, yc, p);
-                Real rho = amrex::max(p.rho_l1 * std::exp(-(phi - p.phi_l1)
+                Real rho;
+                if (p.ic_mode == IC_SEMI_DETACHED && xc >= p.x_l1) {
+                    // Semi-detached IC: accretor side left at the floor; the
+                    // L1-plane discontinuity is the stream's birth.
+                    rho = p.rho_floor;
+                } else {
+                    rho = amrex::max(p.rho_l1 * std::exp(-(phi - p.phi_l1)
                                                           / (p.cs * p.cs)),
                                       p.rho_floor);
-                if (p.perturb != 0.0_rt && xc < p.x_l1) {
-                    rho *= 1.0_rt + p.perturb;
+                    if (p.perturb != 0.0_rt && xc < p.x_l1) {
+                        rho *= 1.0_rt + p.perturb;
+                    }
                 }
                 u(i, j, k, URHO) = rho;
                 u(i, j, k, UMX)  = 0.0_rt;
@@ -479,6 +497,23 @@ class RocheBlock : public AmrCore {
                 const Real mx_c = mx_new, my_c = my_new;
                 mx_new += dt * 2.0_rt * p.omega * my_c;
                 my_new -= dt * 2.0_rt * p.omega * mx_c;
+
+                // Velocity cap (roche.vmax > 0): limit |v| after all sources.
+                // Expansion into near-vacuum (e.g. the semi-detached IC's L1
+                // discontinuity: donor at rho_l1 next to the floor) gives
+                // floor-density cells a pressure kick whose v = mom/rho blows
+                // up since rho ~ 0; that collapses dt and stalls the run. The
+                // cap clips those jets while preserving direction. Off by
+                // default, so the overcontact mode is bitwise unchanged.
+                if (p.vmax > 0.0_rt) {
+                    const Real vmag = std::sqrt(mx_new * mx_new
+                                                + my_new * my_new) / rho_new;
+                    if (vmag > p.vmax) {
+                        const Real fac = p.vmax / vmag;
+                        mx_new *= fac;
+                        my_new *= fac;
+                    }
+                }
 
                 un(i, j, k, URHO) = rho_new;
                 un(i, j, k, UMX)  = mx_new;
@@ -894,6 +929,7 @@ void MyMain() {
         pp.query("rho_floor", p.rho_floor);
         pp.query("soft", p.soft);
         pp.query("cfl", p.cfl);
+        pp.query("vmax", p.vmax);
         pp.query("perturb", p.perturb);
         pp.query("n_phi", p.n_phi);
         pp.query("n_r", p.n_r);
@@ -903,6 +939,15 @@ void MyMain() {
         pp.query("plot_int", plot_int);
         pp.query("print_int", print_int);
         pp.query("poison_test", poison_test);
+        std::string ic_mode_str = "overcontact";
+        pp.query("ic_mode", ic_mode_str);
+        if (ic_mode_str == "semi_detached" || ic_mode_str == "semi-detached") {
+            p.ic_mode = IC_SEMI_DETACHED;
+        } else if (ic_mode_str == "overcontact") {
+            p.ic_mode = IC_OVERCONTACT;
+        } else {
+            amrex::Abort("roche.ic_mode must be 'overcontact' or 'semi_detached'");
+        }
     }
     derive(p);
     amrex::Print().SetPrecision(10)
@@ -910,6 +955,10 @@ void MyMain() {
         << ", period = " << 2.0_rt * M_PI / p.omega
         << ", stars at " << p.x1 << ", " << p.x2
         << ", L1 at " << p.x_l1 << ", Phi_L1 = " << p.phi_l1 << '\n';
+    amrex::Print() << "IC mode: "
+                   << (p.ic_mode == IC_SEMI_DETACHED ? "semi_detached"
+                                                     : "overcontact")
+                   << '\n';
 
     // Polar blocks share one logical domain box; the bridge has its own.
     Box domain_polar(IntVect{}, IntVect{AMREX_D_DECL(p.n_phi - 1, p.n_r - 1, 0)});

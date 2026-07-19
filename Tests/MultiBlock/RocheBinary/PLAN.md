@@ -124,7 +124,7 @@ Context: the q=2 20-orbit run settles quasi-steady by t≈50 (~1.7 orbits);
 the transient is the interesting part, so stretch it. Each setup is <30 lines
 in main.cpp unless noted; run 20 orbits (~12-15 min wall) via run_roche_video.sh.
 
-### A. Semi-detached start (lobe 2 initially empty) — DO THIS FIRST
+### A. Semi-detached start (lobe 2 initially empty) — DONE (2026-07-19)
 - IC: rho = equilibrium profile for x < x_l1 only, floor beyond (the L1-plane
   discontinuity IS the initial condition — the stream's birth). Gate behind a
   new key, e.g. `roche.ic_mode="semi_detached"` (default "overcontact").
@@ -134,6 +134,20 @@ in main.cpp unless noted; run 20 orbits (~12-15 min wall) via run_roche_video.sh
 - Acceptance: lobe2 mass grows monotonically from ~floor to ~1-5% of lobe1;
   L1 flux > 0 sustained and decaying as lobe2 fills; no NaN over 20 orbits;
   video shows deflected stream (not a symmetric bridge).
+- RESULT (q=1, cs=0.25, stop_time=70 ≈ 2 orbits, per user "run until settled"): new keys
+  `roche.ic_mode` ("overcontact"|"semi_detached") + `roche.vmax` (velocity cap, 0=off).
+  IC cut `xc >= x_l1` -> floor. The L1-plane density jump (rho_l1 next to 1e-8 floor) drives
+  an expansion-into-vacuum Riemann problem whose floor-cells develop v=mom/rho ~ 5000, collapsing
+  dt (~6e-7) and stalling the run. Fix: velocity cap (roche.vmax=1.0, 4*cs) clips the vacuum jets
+  after the hydro update while preserving direction; transonic stream untouched. Default vmax=0 so
+  overcontact is bitwise unchanged (step-1 drift exactly 0 with vmax=1.0 too — cap is mass-conservative,
+  only touches momentum, never triggers in equilibrium). Verified: poison 0 (1+2 ranks), step-1 drift 0,
+  1v2 bitwise identical (compare_ranks worst=0), 4 MultiBlock ctests pass, DEBUG 5-step clean, 0 NaN to t=70.
+  lobe2 grows monotonically 4.9e-8 -> 7.6e-3 (0.7% of lobe1); L1 flux sustained ~5e-4; drift -2.2% at
+  t=70 (gas outflow through accretor's open reservoir edges, ~1%/orbit, do-not-break #8). Vision oracle
+  confirms Coriolis-deflected stream, no seam artifacts. Published: ~/stardisk-site/semidetached.mp4 +
+  semidetached_rho.png + site section. NOTE: full 1-5% lobe2 fill + L1-flux decay need ~5-10 orbits
+  (run was cut to 2 orbits per user); the 20-orbit "settling" target is untested but the scheme is stable.
 
 ### B. Differential contact depth (roche.rho_l1_1 != rho_l1_2)
 - IC: per-lobe normalization, smoothed over DeltaPhi ~ cs^2 at the neck (avoid

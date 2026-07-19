@@ -165,6 +165,8 @@ Key design points: 20 one-sided seam fills = 16 tangential (offset-only, as Star
 2. **FillPhysicalBCs overwrote seam-filled ghosts**: loop order FillGhosts -> FillSeams -> FillPhysicalBCs (StarDisk idiom) is only safe if BC edges and seam edges are disjoint. e1/w2 j-hi are seams (bridge), but the inherited polar j-hi zero-gradient BC overwrote the seam-filled ghosts -> one-sided flux across the seam -> +2.95e-6 mass/step created in the bridge. Fix: per-edge seam flag in BlockGeom, BCs skip seam edges. **Lesson: when adding seams to an existing block layout, audit every BC edge for overlap.**
 3. **Zero-gradient outflow runaway in a tenuous hydrostatic atmosphere**: ghost copies of the interior let the discretely-imbalanced boundary shell collapse inward and the BC chases it: +25% mass and Mach>4 tenuous gas by t=4, dt collapsing. Fix: far-field reservoir BC (ghost = initial equilibrium state stored in Uinit) -> exchange driven only by genuine interior relaxation; drift -0.08%/t=4, bounded velocities. **Lesson: zero-gradient outflow is unsafe for steep stratified atmospheres; pin the boundary to equilibrium or use a reservoir.**
 
+**Queued setup A (semi-detached) — DONE 2026-07-19:** new keys `roche.ic_mode` ("overcontact"|"semi_detached") and `roche.vmax` (velocity cap, 0=off). Semi-detached IC cuts `xc >= x_l1` to the floor (donor filled, accretor empty; L1-plane discontinuity). The donor-vs-vacuum jump drives an expansion-into-vacuum Riemann problem whose floor-cells get v=mom/rho ~ 5000, collapsing dt (~6e-7) and stalling; fix = velocity cap `roche.vmax=1.0` (4*cs) after the hydro update, preserving direction, transonic stream untouched. **vmax defaults 0 so overcontact is bitwise unchanged** (step-1 drift 0 even with vmax=1.0 — cap only touches momentum, never triggers in equilibrium). Verified q=1 cs=0.25: poison 0 (1+2 ranks), step-1 drift 0, 1v2 bitwise (worst=0), 4 MultiBlock ctests pass, DEBUG 5-step clean, 0 NaN to t=70 (2 orbits). lobe2 monotonic 4.9e-8 -> 7.6e-3 (0.7% of lobe1), L1 flux sustained ~5e-4, drift -2.2% at t=70 (open-edge outflow, ~1%/orbit). Run cut to 2 orbits per user ("until settled"); full 1-5% fill + L1-flux decay need ~5-10 more orbits (scheme stable). Published `~/stardisk-site/semidetached.mp4` + `semidetached_rho.png` + site section.
+
 ### Web server (rho panel viewer, 2026-07-19)
 
 Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, one section per test) + `stardisk_rho.png` (StarDisk t=0/t=2pi/drift) + `roche_rho.png` (RocheBinary t=0/t=4 transfer run/drift) + `roche_evolution.mp4` (64-frame video of the perturb=0.05 run to t=4, embedded in the RocheBinary section) + `m2_05.mp4` (q=0.5 pipeline demo) + `bug_showcase.png` (bring-up failure modes vs fixed scheme, q=2 20-orbit work) + `q2_20orb.mp4` (20-orbit q=2 video, 568 frames). Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
@@ -182,3 +184,23 @@ Updating the site (no restart needed — the http.server serves new/changed file
 4. Verify: `curl -s -o /dev/null -w "%{http_code} %{size_download}\n" http://localhost:8000/FILE` and `http://localhost:8000/` — expect 200s with plausible sizes.
 
 NOTE: `tailscale serve` (proper HTTPS on `blu.<tailnet>.ts.net`) is blocked — serve-config writes need root/operator and sudo is broken in non-interactive shells on this box (`/run/wrappers/bin` has no sudo). Fix once from a real terminal: `sudo tailscale set --operator=$USER`, then `tailscale serve --bg /home/cernetic/stardisk-site`.
+
+### Vision oracle (Ollama Cloud `gemma4:31b-cloud`, 2026-07-19)
+
+The main agent runs on `zai/glm-5.2` (text-only — `read` on an image returns `[image omitted: model does not support vision]`). To inspect any plot/frame/screenshot, query the vision oracle below instead of `read`.
+
+**Setup (already done):** the authenticated system `ollama.service` (`/bin/ollama serve`, root) proxies cloud models to ollama.com via the device keypair in `~/.ollama`. No API key, no local weights. Model: `gemma4:31b-cloud` (vision+tools+thinking; ~10–45 s/query).
+
+**Usage** — from the JS eval kernel:
+
+```
+import { ollamaVision } from "/home/cernetic/.config/ollama/vision.mjs";
+const r = await ollamaVision("/home/cernetic/stardisk-site/roche_rho.png",
+                             "Describe this figure; flag any seam artifacts.",
+                             { temperature: 0.2 });
+if (r.ok) console.log(r.content); else console.log(r);   // {ok,via,model,dt,tokens,content|error}
+```
+
+`ollamaVision(imagePath, prompt, opts?)` is daemon-first (`http://localhost:11434/api/chat`); it falls back to direct `https://ollama.com/api/chat` with a Bearer key from `~/.config/ollama/cloud_key` only if the daemon is down. Verified accurate on `stardisk_rho.png` (3 panels, circular star hole, inferno log ρ, RdBu drift) and `roche_rho.png` (two stars at ±2, L1 bridge mass transfer, no seams).
+
+**CRITICAL — never pull local model tags on this 7.8 GB box.** `ollama pull qwen3.5` (6.6 GB local) OOM-killed the system `ollama.service` (`failed (oom-kill)`). Only ever use `<model>:<size>-cloud` tags (manifest-only, 342 B). If `systemctl is-active ollama` shows `failed`, restart from a real terminal (sudo is broken non-interactively): `sudo systemctl reset-failed ollama && sudo systemctl start ollama` — or drop an API key in `~/.config/ollama/cloud_key` to switch to the direct-cloud fallback.
