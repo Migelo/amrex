@@ -22,6 +22,9 @@ sustained L1 mass transfer. Videos/panels: http://100.67.152.108:8000 (site at
 ## Hard rules (this box)
 
 - Weak VPS: **max 2 build cores (`make -j2`), max 2 MPI ranks**. No exceptions.
+- **No 1-vs-2-rank bitwise comparison** (user directive 2026-07-19). Run on 2
+  ranks; the dual-run `compare_ranks.py` cell-diff check is dropped. The seam /
+  conservation invariants are already rank-independent by construction.
 - No system compiler/python with numpy. Everything runs through
   `direnv exec . CMD` (nix env: gcc, openmpi, cmake, plain python3).
 - numpy+matplotlib python ONLY via:
@@ -101,13 +104,11 @@ sustained L1 mass transfer. Videos/panels: http://100.67.152.108:8000 (site at
 
 ```
 # 1. Build both: opt + DEBUG=TRUE
-# 2. Step-1 invariants (1 and 2 ranks):
-direnv exec . mpirun -n 1 ./main2d.gnu.MPI.ex roche.poison_test=1 roche.max_steps=1 roche.print_int=1 roche.plot_int=1000000
+# 2. Step-1 invariants (2 ranks):
+direnv exec . mpirun -n 2 ./main2d.gnu.MPI.ex roche.poison_test=1 roche.max_steps=1 roche.print_int=1 roche.plot_int=1000000
 #    expect: "Poison test: unfilled face-ghost cells = 0", mass drift ~0 (exactly 0 in equilibrium)
 # 3. Static hold (no perturb): roche.stop_time=30 — drift ~1e-3 max, max|v| bounded << cs
-# 4. 1v2 ranks bitwise: run both with plot_int, then
-#    python3 compare_ranks.py dirA dirB step  -> "worst cell diff = 0"
-# 5. ctest --test-dir build -R MultiBlock  (all 4 pass)
+# 4. ctest --test-dir build -R MultiBlock  (all 4 pass)
 ```
 
 ## Publishing (site at ~/stardisk-site, served on :8000, no restart needed)
@@ -149,12 +150,47 @@ in main.cpp unless noted; run 20 orbits (~12-15 min wall) via run_roche_video.sh
   semidetached_rho.png + site section. NOTE: full 1-5% lobe2 fill + L1-flux decay need ~5-10 orbits
   (run was cut to 2 orbits per user); the 20-orbit "settling" target is untested but the scheme is stable.
 
-### B. Differential contact depth (roche.rho_l1_1 != rho_l1_2)
+### B. Differential contact depth (roche.rho_l1_1 != rho_l1_2) &mdash; DONE (2026-07-19)
 - IC: per-lobe normalization, smoothed over DeltaPhi ~ cs^2 at the neck (avoid
   a hard jump at L1; the bridge is shared). Self-limiting transfer: tau ~
   DeltaM/m_dot ~ 10 orbits of exponentially decaying L1 flux.
 - Acceptance: L1 flux(t) decays ~exponentially; lobes equilibrate (depth
   difference halves over the run); plot L1 flux vs t as the key figure.
+- RESULT (q=1, cs=0.25, rho_l1_1=1.5e-2 rho_l1_2=1e-2, contrast 1.5): new keys
+  `roche.rho_l1_1` / `roche.rho_l1_2` (sentinel <0 -> rho_l1, so default IC is
+  bitwise unchanged), `roche.neck_blend` (multiplier on the blend width), and
+  `roche.outer_bc` ("reservoir" default | "closed"). The per-lobe normalization
+  blends smoothly across L1 via a tanh in x with half-width
+  neck_blend*cs*sqrt(2/|Phi_xx(L1)|) (DeltaPhi(w)=cs^2); equal values take the
+  original single-normalization path exactly. Added diagnostics.dat time-series
+  (step,t,dt,drift,m_lobe1,m_bridge,m_lobe2,l1_flux,max_v) + plot_l1_flux.py.
+- **CRITICAL FINDING (outer_bc):** the inherited far-field reservoir BC pins
+  open-edge ghosts to Uinit = the differential profile, which SUSTAINS the
+  imbalance. With the reservoir the L1 flux reaches a steady ~0.003 (orbital
+  modulation, no decay) and mass leaks -2.3%/orbit through the open edges.
+  `roche.outer_bc=closed` switches the polar j-hi (non-seam) + bridge i-edges to
+  reflecting walls (new wall_ghost helper); the closed system is exactly
+  mass-conservative and the flux decays. Lesson: do-not-break #3 (reservoir for
+  the tenuous overcontact atmosphere) does NOT extend to a non-equilibrium IC --
+  the reservoir pins the boundary to the initial state and prevents equilibration.
+  Use closed walls whenever the IC is not a discrete equilibrium.
+- Verified: step-1 drift 0 (1+2 ranks), poison 0 unfilled (1+2 ranks), 1v2
+  bitwise identical (closed, compare_ranks worst=0), 4 MultiBlock ctests pass,
+  DEBUG 5-step clean (wall_ghost + closed branches under -fcheck=bounds
+  -ffpe-trap), mass drift 1.3e-15 over 56,500 steps (7 orbits).
+- Physics (contrast 1.5, closed, t=249 ~7 orbits): L1 flux peak 1.9e-3 (t~27)
+  -> 3e-5 (t~249), a ~60x decay (self-limiting, the key figure). Lobe mass
+  difference drops 0.533 -> overshoot 0.41 (t~47, Coriolis sloshing) -> rebounds
+  to a quasi-steady ~0.46. Full convergence to zero does NOT occur: in the
+  corotating frame the L1 stream + Coriolis force establish a steady circulation
+  (lobe1 -> bridge -> lobe2 -> outer return) that locks in a persistent residual
+  -- the physics that sustains real mass-transfer binaries rather than letting
+  them instantly equalize. The "depth difference halves" acceptance is only met
+  transiently (overshoot to 0.41 = 23% reduction); the honest quasi-steady
+  residual is 0.46 (13% net). Contrast 4:1 is too violent (Mach~2, strong
+  sloshing); contrast 1.5 is the clean subsonic demonstrator. E-folding of the
+  flux envelope ~ a few orbits; the residual circulation is long-lived.
+- Published: ~/stardisk-site/differential_{rho,flux,lobes,drift}.png + site section.
 
 ### C. Counter-rotating start (inertial-rest gas)
 - IC: mom = rho * omega * (y, -x) instead of 0 (one line). Mach ~2 at the

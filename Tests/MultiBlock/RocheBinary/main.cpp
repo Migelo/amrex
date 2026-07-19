@@ -78,6 +78,8 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <fstream>
+#include <iomanip>
 
 static_assert(AMREX_SPACEDIM == 2, "RocheBinary is a 2D-only test");
 
@@ -118,12 +120,17 @@ struct RocheParams {
     Real stretch   = 1.0;   // radial grading exponent (>1 clusters inward)
     Real cs        = 0.25;  // isothermal sound speed
     Real rho_l1    = 1.e-2; // IC density at L1 (sets the overcontact depth)
+    Real rho_l1_1  = -1.0;  // <0 -> use rho_l1 (star-1 lobe normalization)
+    Real rho_l1_2  = -1.0;  // <0 -> use rho_l1 (star-2 lobe normalization)
+    Real neck_blend = 1.0;  // multiplier on the L1-neck blend width
     Real rho_floor = 1.e-8;
     Real soft      = 0.0;   // gravitational softening length
     Real cfl       = 0.5;
     Real vmax      = 0.0;   // >0 caps |v| (semi-detached vacuum-jet fix)
     Real perturb   = 0.0;   // relative density boost on the star-1 side
     int  ic_mode   = IC_OVERCONTACT;  // IC_OVERCONTACT | IC_SEMI_DETACHED
+    int  outer_closed = 0;  // 1: reflecting wall at outer edges (closed system
+                            //    for the differential-depth IC, else reservoir)
     int  n_phi     = 64;    // tangential cells per polar block (= bridge i)
     int  n_r       = 64;    // radial cells per polar block
     int  n_bridge  = 64;    // bridge cells along the corridor axis (j)
@@ -133,6 +140,8 @@ struct RocheParams {
     Real x2        = 0.0;   // star 2 position
     Real x_l1      = 0.0;   // L1 location on the axis
     Real phi_l1    = 0.0;   // Roche potential at L1
+    Real phi_xx_l1 = 0.0;   // d^2 Phi/dx^2 at L1 (neck-blend width scale)
+    Real blend_width = 0.0; // L1-neck normalization-blend half-width
 };
 
 // Effective Roche potential in the corotating frame (COM at origin).
@@ -154,6 +163,21 @@ Real potential_dx (Real x, RocheParams const& p) {
          + p.m2 * dx2 / (s2 * std::sqrt(s2))
          - p.omega * p.omega * x;
 }
+// Reflecting-wall ghost fill: mirror the interior state across a face with
+// edge direction (ex, ey) on this left-handed grid, flipping the normal
+// momentum component (free slip). Used for the star surface and, in
+// closed-outer-boundary mode, the outer edges.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void wall_ghost (Real ex, Real ey, Real rho_in, Real mx_in, Real my_in,
+                 Real& rho_g, Real& mx_g, Real& my_g) {
+    const Real anorm = std::sqrt(ey * ey + ex * ex);
+    const Real nx = -ey / anorm;
+    const Real ny =  ex / anorm;
+    const Real mn = mx_in * nx + my_in * ny;
+    rho_g = rho_in;
+    mx_g  = mx_in - 2.0_rt * mn * nx;
+    my_g  = my_in - 2.0_rt * mn * ny;
+}
 
 void derive (RocheParams& p) {
     p.omega = std::sqrt((p.m1 + p.m2) / (p.sep * p.sep * p.sep));  // G = 1
@@ -172,6 +196,22 @@ void derive (RocheParams& p) {
     }
     p.x_l1 = 0.5_rt * (lo + hi);
     p.phi_l1 = potential(p.x_l1, 0.0_rt, p);
+    // Resolve per-lobe normalizations (sentinel -> rho_l1; backward compat:
+    // both unset => rho_l1_1 == rho_l1_2 == rho_l1, IC unchanged).
+    if (p.rho_l1_1 < 0.0_rt) p.rho_l1_1 = p.rho_l1;
+    if (p.rho_l1_2 < 0.0_rt) p.rho_l1_2 = p.rho_l1;
+    // Curvature of Phi along the corridor axis at L1 (a saddle: max along x).
+    // Sets the neck-blend width for the differential-depth IC to ~cs^2 in
+    // potential: w = cs*sqrt(2/|Phi_xx|) => DeltaPhi(w) = cs^2.
+    {
+        const Real hb = 1e-5_rt * p.sep;
+        const Real d2 = (potential_dx(p.x_l1 + hb, p)
+                       - potential_dx(p.x_l1 - hb, p)) / (2.0_rt * hb);
+        p.phi_xx_l1 = d2;
+        p.blend_width = (std::abs(d2) > 0.0_rt)
+            ? p.neck_blend * p.cs * std::sqrt(2.0_rt / std::abs(d2))
+            : 1.0_rt;
+    }
     // Geometry constraints: the annuli must not overlap, and the bridge
     // corridor (x1 + r_ann1, x2 - r_ann2) must contain L1.
     if (p.r_ann1 + p.r_ann2 >= p.sep) {
@@ -316,8 +356,18 @@ class RocheBlock : public AmrCore {
                     // L1-plane discontinuity is the stream's birth.
                     rho = p.rho_floor;
                 } else {
-                    rho = amrex::max(p.rho_l1 * std::exp(-(phi - p.phi_l1)
-                                                          / (p.cs * p.cs)),
+                    // Per-lobe normalization: rho_l1_1 (star 1) smoothly
+                    // blended to rho_l1_2 (star 2) across the L1 neck over
+                    // width blend_width (~cs^2 in potential, so the bridge is
+                    // shared with no hard jump). Equal values recover the
+                    // single-normalization overcontact IC exactly.
+                    const Real rl1 = (p.rho_l1_1 == p.rho_l1_2)
+                        ? p.rho_l1
+                        : (p.rho_l1_2 + 0.5_rt * (p.rho_l1_1 - p.rho_l1_2)
+                                     * (1.0_rt - std::tanh((xc - p.x_l1)
+                                                            / p.blend_width)));
+                    rho = amrex::max(rl1 * std::exp(-(phi - p.phi_l1)
+                                                    / (p.cs * p.cs)),
                                       p.rho_floor);
                     if (p.perturb != 0.0_rt && xc < p.x_l1) {
                         rho *= 1.0_rt + p.perturb;
@@ -334,11 +384,15 @@ class RocheBlock : public AmrCore {
     }
 
     // Physical boundary conditions on the ghost cells of U. Polar blocks:
-    // reflecting wall at the star (j-low), zero-gradient outflow at j-high.
-    // Bridge block: zero-gradient outflow on both i edges (its j edges are
-    // seams). Ghost cells between grids of a block belong to FillGhosts().
+    // reflecting wall at the star (j-low); at j-high a far-field reservoir
+    // (initial state), or a reflecting wall when outer_closed (closed system
+    // for the differential-depth IC -- the reservoir would pin the boundary
+    // to the unequal initial profile and sustain the imbalance). Bridge
+    // block: same choice on both i edges (its j edges are seams). Ghost cells
+    // between grids of a block belong to FillGhosts().
     void FillPhysicalBCs() {
         const Box& domain = Geom(0).Domain();
+        const bool closed = params.outer_closed;
         for (MFIter mfi(U); mfi.isValid(); ++mfi) {
             const Box& vbx = mfi.validbox();
             Array4<Real> u = U.array(mfi);
@@ -371,23 +425,32 @@ class RocheBlock : public AmrCore {
                     u(i, j, k, UMY)  = my - 2.0_rt * mn * ny;
                 });
                 }
-                // j-high: far-field reservoir (initial equilibrium state),
-                // unless the edge is a seam. Zero-gradient here lets the
-                // tenuous boundary shell collapse inward and feeds mass
-                // inflow; the reservoir breaks that feedback. (Skipped on
-                // seams: overwriting seam-filled ghosts would break flux
-                // cancellation across the seam.)
+                // j-high (unless a seam): reservoir (initial state), or a
+                // reflecting wall when closed. Skipped on seams either way:
+                // overwriting seam-filled ghosts breaks flux cancellation.
                 if (!g.jhi_seam && ghi.ok()) {
                 ParallelFor(ghi,
                             [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     amrex::ignore_unused(k);
-                    for (int n = 0; n < ncomp; ++n) {
-                        u(i, j, k, n) = u0(i, j - 1, k, n);
+                    if (closed) {
+                        const Real ex = v(i + 1, j, 0, 0) - v(i, j, 0, 0);
+                        const Real ey = v(i + 1, j, 0, 1) - v(i, j, 0, 1);
+                        Real rg, mxg, myg;
+                        wall_ghost(ex, ey, u(i, j - 1, k, URHO),
+                                   u(i, j - 1, k, UMX), u(i, j - 1, k, UMY),
+                                   rg, mxg, myg);
+                        u(i, j, k, URHO) = rg;
+                        u(i, j, k, UMX)  = mxg;
+                        u(i, j, k, UMY)  = myg;
+                    } else {
+                        for (int n = 0; n < ncomp; ++n) {
+                            u(i, j, k, n) = u0(i, j - 1, k, n);
+                        }
                     }
                 });
                 }
             } else {
-                // Bridge: far-field reservoir on the i edges.
+                // Bridge: reservoir (or reflecting wall when closed) on i edges.
                 const Box glo = amrex::adjCellLo(vbx, ix, nghost)
                     & amrex::adjCellLo(domain, ix, nghost);
                 const Box ghi = amrex::adjCellHi(vbx, ix, nghost)
@@ -396,8 +459,20 @@ class RocheBlock : public AmrCore {
                 ParallelFor(glo,
                             [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     amrex::ignore_unused(k);
-                    for (int n = 0; n < ncomp; ++n) {
-                        u(i, j, k, n) = u0(i + 1, j, k, n);
+                    if (closed) {
+                        const Real ex = v(i + 1, j + 1, 0, 0) - v(i + 1, j, 0, 0);
+                        const Real ey = v(i + 1, j + 1, 0, 1) - v(i + 1, j, 0, 1);
+                        Real rg, mxg, myg;
+                        wall_ghost(ex, ey, u(i + 1, j, k, URHO),
+                                   u(i + 1, j, k, UMX), u(i + 1, j, k, UMY),
+                                   rg, mxg, myg);
+                        u(i, j, k, URHO) = rg;
+                        u(i, j, k, UMX)  = mxg;
+                        u(i, j, k, UMY)  = myg;
+                    } else {
+                        for (int n = 0; n < ncomp; ++n) {
+                            u(i, j, k, n) = u0(i + 1, j, k, n);
+                        }
                     }
                 });
                 }
@@ -405,8 +480,20 @@ class RocheBlock : public AmrCore {
                 ParallelFor(ghi,
                             [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     amrex::ignore_unused(k);
-                    for (int n = 0; n < ncomp; ++n) {
-                        u(i, j, k, n) = u0(i - 1, j, k, n);
+                    if (closed) {
+                        const Real ex = v(i, j + 1, 0, 0) - v(i, j, 0, 0);
+                        const Real ey = v(i, j + 1, 0, 1) - v(i, j, 0, 1);
+                        Real rg, mxg, myg;
+                        wall_ghost(ex, ey, u(i - 1, j, k, URHO),
+                                   u(i - 1, j, k, UMX), u(i - 1, j, k, UMY),
+                                   rg, mxg, myg);
+                        u(i, j, k, URHO) = rg;
+                        u(i, j, k, UMX)  = mxg;
+                        u(i, j, k, UMY)  = myg;
+                    } else {
+                        for (int n = 0; n < ncomp; ++n) {
+                            u(i, j, k, n) = u0(i - 1, j, k, n);
+                        }
                     }
                 });
                 }
@@ -926,6 +1013,9 @@ void MyMain() {
         pp.query("stretch", p.stretch);
         pp.query("cs", p.cs);
         pp.query("rho_l1", p.rho_l1);
+        pp.query("rho_l1_1", p.rho_l1_1);
+        pp.query("rho_l1_2", p.rho_l1_2);
+        pp.query("neck_blend", p.neck_blend);
         pp.query("rho_floor", p.rho_floor);
         pp.query("soft", p.soft);
         pp.query("cfl", p.cfl);
@@ -948,6 +1038,15 @@ void MyMain() {
         } else {
             amrex::Abort("roche.ic_mode must be 'overcontact' or 'semi_detached'");
         }
+        std::string outer_bc_str = "reservoir";
+        pp.query("outer_bc", outer_bc_str);
+        if (outer_bc_str == "closed") {
+            p.outer_closed = 1;
+        } else if (outer_bc_str == "reservoir") {
+            p.outer_closed = 0;
+        } else {
+            amrex::Abort("roche.outer_bc must be 'reservoir' or 'closed'");
+        }
     }
     derive(p);
     amrex::Print().SetPrecision(10)
@@ -959,6 +1058,16 @@ void MyMain() {
                    << (p.ic_mode == IC_SEMI_DETACHED ? "semi_detached"
                                                      : "overcontact")
                    << '\n';
+    if (p.rho_l1_1 != p.rho_l1_2) {
+        amrex::Print().SetPrecision(10)
+            << "Differential contact depth: rho_l1_1 = " << p.rho_l1_1
+            << ", rho_l1_2 = " << p.rho_l1_2
+            << ", neck blend width = " << p.blend_width
+            << " (|Phi_xx(L1)| = " << std::abs(p.phi_xx_l1) << ")\n";
+    }
+    if (p.outer_closed) {
+        amrex::Print() << "Outer boundary: closed (reflecting walls)\n";
+    }
 
     // Polar blocks share one logical domain box; the bridge has its own.
     Box domain_polar(IntVect{}, IntVect{AMREX_D_DECL(p.n_phi - 1, p.n_r - 1, 0)});
@@ -1144,6 +1253,25 @@ void MyMain() {
             amrex::Abort("RocheBinary: poison test failed");
         }
     }
+    // Time-series diagnostics for the L1-flux / lobe-equilibration figures
+    // (parsed stdout is fragile; a structured file is reusable for setups
+    // B/C/D). Written by the IO rank only; the reductions feeding it are
+    // collective, so every rank holds the same values.
+    std::ofstream diag;
+    if (ParallelDescriptor::IOProcessor()) {
+        diag.open("RocheBinary/diagnostics.dat", std::ios::out);
+        diag << "# step t dt mass_drift m_lobe1 m_bridge m_lobe2 l1_flux max_v\n";
+    }
+    auto write_diag = [&](int s, Real tt, Real dtt, Real mdrift, Real ml1,
+                          Real mbr, Real ml2, Real flux, Real mxv) {
+        if (ParallelDescriptor::IOProcessor()) {
+            diag << s << ' ' << std::scientific << std::setprecision(12)
+                 << tt << ' ' << dtt << ' ' << mdrift << ' ' << ml1 << ' '
+                 << mbr << ' ' << ml2 << ' ' << flux << ' ' << mxv << '\n';
+            diag.flush();
+        }
+    };
+    write_diag(0, 0.0_rt, 0.0_rt, 0.0_rt, rm0[0], rm0[2], rm0[1], 0.0_rt, 0.0_rt);
 
     while (t < stop_time && step < max_steps) {
         Real dt = blocks[0]->ComputeDt();
@@ -1168,13 +1296,16 @@ void MyMain() {
                 maxv = amrex::max(maxv, b->MaxVel());
             }
             const auto rm = region_mass();
+            const Real l1_flux = br.MidplaneFlux();
             amrex::Print().SetPrecision(10)
                 << "Step #" << step << ", t = " << t << ", dt = " << dt
                 << ", mass drift = " << (mass - mass0) / mass0
                 << ", m_lobe1 = " << rm[0] << ", m_bridge = " << rm[2]
                 << ", m_lobe2 = " << rm[1]
-                << ", L1 flux = " << br.MidplaneFlux()
+                << ", L1 flux = " << l1_flux
                 << ", max|v| = " << maxv << '\n';
+            write_diag(step, t, dt, (mass - mass0) / mass0,
+                       rm[0], rm[2], rm[1], l1_flux, maxv);
             for (int b = 0; b < 9; ++b) {
                 const auto [rlo, rhi] = blocks[b]->RhoMinMax();
                 amrex::Print().SetPrecision(10)
