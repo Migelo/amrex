@@ -9,7 +9,8 @@
 # added unless already supplied. Star geometry for the renderer's masks is
 # derived from roche.m1/m2/sep/a (defaults 1 1 4 1):
 #   x1 = -sep*m2/(m1+m2),  x2 = +sep*m1/(m1+m2)
-# Env knobs: FPS (default 12), CRF (default 15).
+# Env knobs: FPS (default 12), CRF (default 15), DRIFT=1 (render relative
+# (rho-rho0)/rho0 instead of rho -- for subtle-transfer runs).
 #
 # Examples:
 #   ./run_roche_video.sh baseline roche.perturb=0.05 roche.stop_time=4.0
@@ -56,7 +57,7 @@ echo "== [$OUTNAME] workdir: $WORKDIR; stars at x1=$X1 x2=$X2 a=$A"
 (cd "$WORKDIR" && direnv exec . mpirun -n 2 "$EXE" "${EXE_ARGS[@]}")
 
 echo "== [$OUTNAME] rendering frames"
-nix-shell -E "$NIX_PY" --run "python3 $RENDER --base $WORKDIR --outdir $FRAMES --star-x1=$X1 --star-x2=$X2 --star-a=$A"
+nix-shell -E "$NIX_PY" --run "python3 $RENDER --base $WORKDIR --outdir $FRAMES --star-x1=$X1 --star-x2=$X2 --star-a=$A ${DRIFT:+--drift}"
 
 echo "== [$OUTNAME] encoding ${FPS:-12} fps, crf ${CRF:-15}"
 ffmpeg -y -framerate "${FPS:-12}" -i "$FRAMES/frame_%04d.png" \
