@@ -88,3 +88,67 @@ A local scratchpad can help you capture quick reminders, but keep it untracked, 
 2. Do you have a written plan that names owners, validation, and Build & Test commands? If not, write one before editing.
 3. Are tests/docs updated and the exact commands/results logged in the PR/issue? If not, add them.
 4. Are delegation, safety, and hand-off notes captured in canonical threads (not just scratchpads)? If not, update them now.
+
+## Current Situation (2026-07-19, branch `multiblock-three-block-advection`)
+
+Working state for the StarDisk multi-block test. This section is a local scratchpad; prune before merging upstream.
+
+### Goal
+
+Adapt the `Tests/MultiBlock/AdvectionThree` setup (commit `31602db9c`) into a 2D star + accretion disk test: a fixed circular star `r < a` (masked, not evolved; round since 2026-07-19, previously the square `[-a,a]^2` via `r_in(phi)=a/cos(phi)`) surrounded by 4 curvilinear annulus blocks (E, N, W, S). Design decisions (user): **isothermal Euler hydrodynamics**, **fixed star region**.
+
+### Environment
+
+- No system compiler on this NixOS workstation. `shell.nix` + `.envrc` at repo root (tracked since `5ca8de56`; only `.direnv/` is untracked) provide gcc 15.2, gfortran, openmpi 5.0.10, cmake, python3 via direnv.
+- Build: `cd Tests/MultiBlock/StarDisk && direnv exec . make -j4` (~2 min from clean).
+- Executables: `main2d.gnu.MPI.ex` (opt) and `main2d.gnu.DEBUG.MPI.ex` (built with `DEBUG=TRUE`).
+- Run: `mpirun -n 2 ./main2d.gnu.MPI.ex disk.max_steps=1 disk.print_int=1 disk.plot_int=1000000` (ParmParse overrides work; see fixed bug #4).
+
+### The test: `Tests/MultiBlock/StarDisk/` (committed)
+
+`main.cpp`, `GNUmakefile` (DIM=2, MPI), `Make.package`, `CMakeLists.txt` (2D-only target; registered and passing in ctest).
+
+- Blocks: 4 x `DiskBlock : AmrCore`, orientations theta_b = 0, pi/2, pi, 3pi/2. Logical (i=tangential CCW, j=radial). Mapping: `rho(j) = a + (R_out-a)*(j/n_r)^stretch`, `x = rho*(cos,sin)(theta_b+phi)`, i.e. each block is a polar sector of the circular annulus `a < r < R_out`. NOTE: (i=theta, j=r) ordering is **left-handed** -> shoelace volumes need `abs()`, outward face area vectors are `A=(-ey,ex)` (already fixed in code).
+- Metrics from vertex coordinates (face area vectors, cell volumes); no analytic Jacobians. Isothermal Euler (rho, mom_x, mom_y), p = cs^2 rho, Rusanov flux per face, point-mass gravity, explicit Euler. IC: near-equilibrium Keplerian disk `rho ~ r^-q`, `v_phi = sqrt(GM/r - q*cs^2)`.
+- BCs: inner j-edge reflecting wall (star surface), outer j-edge zero-gradient outflow, restricted to domain-edge ghost cells via `adjCellLo/Hi(vbx) & adjCellLo/Hi(domain)`.
+- Seams: 4 tangential seams (E<->N<->W<->S<->E) = 8 one-sided `AlignedBoundaryFn` fills (offset-only `MultiBlockIndexMapping`, `PackComponents{0,0,3}`), closing the annulus with no periodicity anywhere.
+- Kept diagnostics: per-print_int one-line summary (step, t, dt, mass drift, per-block rho ranges), per-block mass + NaN count, and a final `amrex::Abort` on any NaN (ctest pass/fail).
+
+### Bugs fixed during bring-up
+
+1. Left-handed parameterization (see above).
+2. `seam_ghost_lo` built a 1-cell box instead of the full ghost column.
+3. Missing intra-block `U.FillBoundary` for ghosts between grids of a block (`FillGhosts()`).
+4. **ParmParse was dead**: `amrex::Initialize(MPI_COMM_WORLD, cout, cerr, handler)` overload never parses argv; switched to the argc/argv overload. (`AdvectionThree` has the same pattern; harmless there, fully hardcoded.)
+5. `FillPhysicalBCs` applied wall/outflow to internal fab boundaries (fixed with domain intersection).
+6. `RealBox` has no `RealVect` ctor -> `std::array`.
+
+### Verified (1 MPI rank)
+
+Runs to t=2pi (1116 steps). **Mass drift 2.5e-15 after step 1** -> scheme + seams exactly conservative. 4-fold block symmetry holds. Initial total mass 18.84908281 = 6*pi exactly (analytic for rho=r^-1 on the circular annulus 1<r<4). Slow +0.6% drift/orbit = physical flux through the open outer boundary during transient adjustment (not a conservation bug).
+
+### RESOLVED (2026-07-18): seam fills broken with 2 MPI ranks
+
+**Root cause (self-inflicted):** an instrumentation edit accidentally deleted the `FillGhosts()` call from the time loop. `AmrMesh::MakeBaseGrids` chops each 64x64 block into `NProcs` grids, so with 2 ranks every block has 2 fabs (split in j) and the inter-fab ghost ROWS (j=31/32, 128 cells/block) went unfilled; the flux kernel read stale garbage there. On 1 rank there is 1 fab/block (no inter-fab ghosts), so it looked perfect. The "128 seam cells" were the inter-fab rows, not seam columns; the NonLocalBC seam machinery was correct all along (probe-verified bitwise). Fix: call `FillGhosts()` (intra-block `U.FillBoundary`) **before** `FillSeams()` — the upstream MultiBlock idiom (`Tests/MultiBlock/Advection/main.cpp:187`).
+
+**Slivers (secondary, benign):** `MultiBlockCommMetaData::define` grows both dst and src boxes by ngrow (Src/Base/AMReX_NonLocalBCImpl.H:362,369 via BoxArray::intersections, AMReX_BoxArray.cpp:1271), creating 1-cell cross-fab sliver overlaps that read the neighboring src fab's ghost ring and are applied (MPI finish) after the local main fill. Under the FillBoundary-first idiom those ghosts hold current valid data (bitwise identical to the main fill), so slivers are harmless. Not an upstream bug; a latent fragility worth knowing when writing new multi-block tests: **always FillBoundary intra-block ghosts before NonLocalBC seam fills**.
+
+**AdvectionThree:** NOT broken on 2 ranks (earlier byte-wise plotfile diff was a fab-count artifact: 1 rank writes 1 fab/plotfile, 2 ranks write 2; cell-wise parse = bitwise identical).
+
+**Verified:** 2-rank poison test 0 unfilled; 1- and 2-rank runs 0 NaN, bitwise-identical trajectories (mass drift ~2.5e-15 at step 1; +0.61% over one orbit = physical outflow); 4-fold symmetry; `ctest -R StarDisk` (cmake, AMReX_TEST_TYPE=All) passes on `mpiexec -n 2`. Re-verified 2026-07-19 for the circular star (1+2 ranks, full orbit, `stardisk_rho.png` shows a clean round hole, no seam artifacts).
+
+### Status
+
+Committed on `multiblock-three-block-advection` as `Tests/MultiBlock/StarDisk/` (main.cpp, GNUmakefile, Make.package, CMakeLists.txt). Debug instrumentation stripped; kept per-step mass/rho diagnostics + final NaN abort (ctest pass/fail). Untracked, uncommitted by design: `.direnv/` and this AGENTS.md section (`shell.nix` + `.envrc` are tracked since `5ca8de56`). Prune this section when stale.
+
+### Web server (stardisk_rho.png viewer, 2026-07-19)
+
+Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, rho panels + caption) + copy of `stardisk_rho.png`. Served by `python3 -m http.server 8000` (nix-shell python via direnv), detached with `setsid nohup`, log `~/stardisk-site/server.log`. Reachable at:
+
+- tailnet: http://100.67.152.108:8000 (machine `blu`)
+- LAN: http://178.254.33.110:8000
+- local: http://localhost:8000
+
+Restart: `setsid nohup direnv exec /home/cernetic/amrex python3 -m http.server 8000 --directory /home/cernetic/stardisk-site --bind 0.0.0.0 </dev/null >/home/cernetic/stardisk-site/server.log 2>&1 &`. Stop: `pkill -f "http.server 8000"`.
+
+NOTE: `tailscale serve` (proper HTTPS on `blu.<tailnet>.ts.net`) is blocked — serve-config writes need root/operator and sudo is broken in non-interactive shells on this box (`/run/wrappers/bin` has no sudo). Fix once from a real terminal: `sudo tailscale set --operator=$USER`, then `tailscale serve --bg /home/cernetic/stardisk-site`.
