@@ -146,6 +146,8 @@ Committed on `multiblock-three-block-advection` as `Tests/MultiBlock/StarDisk/` 
 
 ### RocheBinary: two stars + bridge (IMPLEMENTED 2026-07-19)
 
+**Handoff: `Tests/MultiBlock/RocheBinary/PLAN.md` is the full instructions doc for the next agent** (mission, hard rules, code map, do-not-break list, verification toolkit, publishing workflow, queued long-settling setups A–D). Read it before continuing this work.
+
 Contact-binary extension of StarDisk: two fixed stars at (±2, 0), each wrapped in 4 polar-sector blocks (annulus 1<r<1.6), plus a 9th curvilinear **bridge block** (Coons patch) connecting the annuli through L1. Isothermal Euler in the corotating frame (Omega^2=G(m1+m2)/D^3): source = -rho grad(Phi_roche) - 2 Omega x (rho u). IC = exact hydrostatic isothermal atmosphere rho = rho_l1 exp(-(Phi-Phi_L1)/cs^2) at rest, L1 found by bisection on dPhi/dx (host). New test dir `Tests/MultiBlock/RocheBinary/` (main.cpp, GNUmakefile, Make.package, CMakeLists.txt, plot_roche.py, compare_ranks.py); ctest auto-registers via GLOB_RECURSE (test `MultiBlock_RocheBinary_2d`, needs AMReX_SPACEDIM=2 configure). StarDisk untouched. Build: `cd Tests/MultiBlock/RocheBinary && direnv exec . make -j2` (this VPS: max 2 cores, max 2 MPI ranks). Render: `python3 plot_roche.py 0 <step>` needs numpy+matplotlib — shell.nix python lacks them; use nix-shell with `(python3.withPackages (ps: [ps.numpy ps.matplotlib]))` over the same fetchTarball pin.
 
 Key design points: 20 one-sided seam fills = 16 tangential (offset-only, as StarDisk) + bridge.jlo<->e1.jhi (offset-only) + **bridge.jhi<->w2.jhi with dtos sign=(-1,1)** (w2's i runs top->bottom, bridge's i bottom->top; offset=(n_phi-1, ±(n_bridge-n_r+1)); sign-flip precedent Tests/MultiBlock/Advection/main.cpp:256). Bridge mapping (i~+y, j~+x) is left-handed like the polar blocks, so the same vertex metrics code (abs shoelace, A=(-ey,ex)) serves all 9 blocks. Defaults: m1=m2=1, D=4, a=1, r_ann1=r_ann2=1.6 (Eggleton lobe 0.379*sep=1.52 contained; 2*r_ann<sep no overlap), cs=0.25, rho_l1=1e-2, floor 1e-8, stop_time=1.0 (~150 steps). Params under `roche.*`, incl. `perturb` (lobe-1 density boost drives L1 transfer), `poison_test` (NaN-poison ghosts + count unfilled face ghosts, must be 0).
@@ -172,5 +174,11 @@ Static site at `~/stardisk-site/` (outside the repo): `index.html` (dark page, o
 - local: http://localhost:8000
 
 Restart: `setsid nohup direnv exec /home/cernetic/amrex python3 -m http.server 8000 --directory /home/cernetic/stardisk-site --bind 0.0.0.0 </dev/null >/home/cernetic/stardisk-site/server.log 2>&1 &`. Stop: `pkill -f "http.server 8000"`.
+
+Updating the site (no restart needed — the http.server serves new/changed files immediately):
+1. Produce artifacts: rho panels via the nix-shell python recipe (`python3 plot_roche.py 0 <step>` in the test dir, writes `roche_rho.png`); showcase via `make_showcase.py`; videos via `run_roche_video.sh OUTNAME roche.key=value ...` (auto-publishes `~/stardisk-site/OUTNAME.mp4` itself).
+2. `cp` other PNGs to `~/stardisk-site/`.
+3. Edit `~/stardisk-site/index.html`: one `<h2>` + `<p class="sub">` + `<figure>` section per artifact (`<img>` for panels, `<video controls loop muted playsinline preload="metadata" poster=...><source ...></video>` for mp4), keep the existing dark style.
+4. Verify: `curl -s -o /dev/null -w "%{http_code} %{size_download}\n" http://localhost:8000/FILE` and `http://localhost:8000/` — expect 200s with plausible sizes.
 
 NOTE: `tailscale serve` (proper HTTPS on `blu.<tailnet>.ts.net`) is blocked — serve-config writes need root/operator and sudo is broken in non-interactive shells on this box (`/run/wrappers/bin` has no sudo). Fix once from a real terminal: `sudo tailscale set --operator=$USER`, then `tailscale serve --bg /home/cernetic/stardisk-site`.
