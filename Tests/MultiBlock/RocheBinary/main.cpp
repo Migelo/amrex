@@ -118,7 +118,36 @@ constexpr int UMY  = 2;
 
 constexpr int nghost = 1;          // first-order: one ghost layer
 
+constexpr int ncorners = 4;
+constexpr int ncornercomp = 2;
+constexpr int nfaces = 4;
+constexpr int nfacecomp = 9;       // (P0.x, P0.y), (P1.x, P1.y), (P2.x, P2.y), w0, w1, w2
+
 enum idirs { ix, iy };
+enum FaceDir { ilo, ihi, jlo, jhi };
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+int face_comp (FaceDir face, int component) {
+    return static_cast<int>(face) * nfacecomp + component;
+}
+
+// Store a degree-2 rational Bezier face. The current grid initializes these
+// as straight segments; callers can replace P1 and the three weights to make
+// an individual cell face curved.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void set_linear_face (Array4<Real> const& faces, int i, int j, int k,
+                      FaceDir face, Real x0, Real y0, Real x2, Real y2) {
+    const int c = face_comp(face, 0);
+    faces(i, j, k, c)     = x0;
+    faces(i, j, k, c + 1) = y0;
+    faces(i, j, k, c + 2) = 0.5_rt * (x0 + x2);
+    faces(i, j, k, c + 3) = 0.5_rt * (y0 + y2);
+    faces(i, j, k, c + 4) = x2;
+    faces(i, j, k, c + 5) = y2;
+    faces(i, j, k, c + 6) = 1.0_rt;
+    faces(i, j, k, c + 7) = 1.0_rt;
+    faces(i, j, k, c + 8) = 1.0_rt;
+}
 
 // Initial-condition mode (host-parsed from roche.ic_mode into this int, since
 // RocheParams is copied by value into device lambdas and cannot hold a string).
@@ -340,6 +369,85 @@ void rusanov_flux (Real const* UL, Real const* UR, Real const* U0L,
                                        - (UL[UMY] - U0L[UMY])));
 }
 
+// Evaluate one rational quadratic Bezier face and its tangent. Faces are
+// stored in outward orientation, so (dy/dt, -dx/dt) is its outward normal
+// line element on this left-handed mesh.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void rational_face_point_tangent (Array4<Real const> const& faces,
+                                  int i, int j, int k, FaceDir face, Real t,
+                                  Real& x, Real& y, Real& dxdt, Real& dydt) {
+    const int c = face_comp(face, 0);
+    const Real x0 = faces(i, j, k, c),     y0 = faces(i, j, k, c + 1);
+    const Real x1 = faces(i, j, k, c + 2), y1 = faces(i, j, k, c + 3);
+    const Real x2 = faces(i, j, k, c + 4), y2 = faces(i, j, k, c + 5);
+    const Real w0 = faces(i, j, k, c + 6);
+    const Real w1 = faces(i, j, k, c + 7);
+    const Real w2 = faces(i, j, k, c + 8);
+    const Real u = 1.0_rt - t;
+    const Real b0 = u * u, b1 = 2.0_rt * u * t, b2 = t * t;
+    const Real db0 = -2.0_rt * u, db1 = 2.0_rt * (u - t), db2 = 2.0_rt * t;
+    const Real den = b0 * w0 + b1 * w1 + b2 * w2;
+    const Real dden = db0 * w0 + db1 * w1 + db2 * w2;
+    const Real nx = b0 * w0 * x0 + b1 * w1 * x1 + b2 * w2 * x2;
+    const Real ny = b0 * w0 * y0 + b1 * w1 * y1 + b2 * w2 * y2;
+    const Real dnx = db0 * w0 * x0 + db1 * w1 * x1 + db2 * w2 * x2;
+    const Real dny = db0 * w0 * y0 + db1 * w1 * y1 + db2 * w2 * y2;
+    x = nx / den;
+    y = ny / den;
+    dxdt = (dnx * den - nx * dden) / (den * den);
+    dydt = (dny * den - ny * dden) / (den * den);
+}
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+Real rational_face_length (Array4<Real const> const& faces,
+                           int i, int j, int k, FaceDir face) {
+    constexpr Real qx[3] = {-0.3872983346207417_rt, 0.0_rt,
+                              0.3872983346207417_rt};
+    constexpr Real qw[3] = {5.0_rt / 18.0_rt, 4.0_rt / 9.0_rt, 5.0_rt / 18.0_rt};
+    Real length = 0.0_rt;
+    for (int q = 0; q < 3; ++q) {
+        Real x, y, dxdt, dydt;
+        rational_face_point_tangent(faces, i, j, k, face, 0.5_rt + qx[q],
+                                    x, y, dxdt, dydt);
+        length += qw[q] * std::sqrt(dxdt * dxdt + dydt * dydt);
+    }
+    return length;
+}
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+Real rational_cell_area (Array4<Real const> const& faces, int i, int j, int k) {
+    constexpr Real qx[3] = {-0.3872983346207417_rt, 0.0_rt,
+                              0.3872983346207417_rt};
+    constexpr Real qw[3] = {5.0_rt / 18.0_rt, 4.0_rt / 9.0_rt, 5.0_rt / 18.0_rt};
+    Real signed_area = 0.0_rt;
+    for (int face = ilo; face <= jhi; ++face) {
+        for (int q = 0; q < 3; ++q) {
+            Real x, y, dxdt, dydt;
+            rational_face_point_tangent(faces, i, j, k, static_cast<FaceDir>(face),
+                                        0.5_rt + qx[q], x, y, dxdt, dydt);
+            signed_area += 0.5_rt * qw[q] * (x * dydt - y * dxdt);
+        }
+    }
+    return std::abs(signed_area);
+}
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void rusanov_face_flux (Real const* UL, Real const* UR, Real const* U0L,
+                        Real const* U0R, Array4<Real const> const& faces,
+                        int i, int j, int k, FaceDir face, Real cs, Real* F) {
+    constexpr Real qx[3] = {-0.3872983346207417_rt, 0.0_rt,
+                              0.3872983346207417_rt};
+    constexpr Real qw[3] = {5.0_rt / 18.0_rt, 4.0_rt / 9.0_rt, 5.0_rt / 18.0_rt};
+    F[0] = F[1] = F[2] = 0.0_rt;
+    for (int q = 0; q < 3; ++q) {
+        Real x, y, dxdt, dydt, fq[ncomp];
+        rational_face_point_tangent(faces, i, j, k, face, 0.5_rt + qx[q],
+                                    x, y, dxdt, dydt);
+        rusanov_flux(UL, UR, U0L, U0R, dydt, -dxdt, cs, fq);
+        for (int n = 0; n < ncomp; ++n) F[n] += qw[q] * fq[n];
+    }
+}
+
 class RocheBlock : public AmrCore {
   public:
     RocheBlock(BlockGeom g_, Geometry const& level_0_geom, RocheParams const& p,
@@ -364,6 +472,8 @@ class RocheBlock : public AmrCore {
         }
         for (MFIter mfi(U, TilingIfNotGPU()); mfi.isValid(); ++mfi) {
             Array4<Real> vol_a = vol.array(mfi);
+            Array4<Real> corner_a = corners.array(mfi);
+            Array4<Real> face_a = faces.array(mfi);
             Array4<Real> u = U.array(mfi);
             Array4<Real const> v = xyv.const_array(mfi);
             ParallelFor(mfi.tilebox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
@@ -372,12 +482,18 @@ class RocheBlock : public AmrCore {
                 const Real x10 = v(i + 1, j, 0, 0), y10 = v(i + 1, j, 0, 1);
                 const Real x11 = v(i + 1, j + 1, 0, 0), y11 = v(i + 1, j + 1, 0, 1);
                 const Real x01 = v(i, j + 1, 0, 0), y01 = v(i, j + 1, 0, 1);
-                // Shoelace. All mappings here are left-handed, so the signed
-                // area comes out negative.
-                vol_a(i, j, k) = 0.5_rt * std::abs((x00 * y10 - x10 * y00)
-                                                 + (x10 * y11 - x11 * y10)
-                                                 + (x11 * y01 - x01 * y11)
-                                                 + (x01 * y00 - x00 * y01));
+                corner_a(i, j, k, 0) = x00; corner_a(i, j, k, 1) = y00;
+                corner_a(i, j, k, 2) = x01; corner_a(i, j, k, 3) = y01;
+                corner_a(i, j, k, 4) = x11; corner_a(i, j, k, 5) = y11;
+                corner_a(i, j, k, 6) = x10; corner_a(i, j, k, 7) = y10;
+                // The endpoints follow each face's outward orientation on
+                // this left-handed mesh. The default linear curves exactly
+                // reproduce the vertex-based geometry used before this field.
+                set_linear_face(face_a, i, j, k, ilo, x00, y00, x01, y01);
+                set_linear_face(face_a, i, j, k, ihi, x11, y11, x10, y10);
+                set_linear_face(face_a, i, j, k, jlo, x10, y10, x00, y00);
+                set_linear_face(face_a, i, j, k, jhi, x01, y01, x11, y11);
+                vol_a(i, j, k) = rational_cell_area(face_a, i, j, k);
                 const Real xc = 0.25_rt * (x00 + x10 + x11 + x01);
                 const Real yc = 0.25_rt * (y00 + y10 + y11 + y01);
                 // Hydrostatic isothermal atmosphere in the Roche potential,
@@ -551,6 +667,7 @@ class RocheBlock : public AmrCore {
             Array4<Real const> u0 = Uinit.const_array(mfi);
             Array4<Real> un = Unew.array(mfi);
             Array4<Real const> v = xyv.const_array(mfi);
+            Array4<Real const> face_a = faces.const_array(mfi);
             Array4<Real const> vol_a = vol.const_array(mfi);
             ParallelFor(mfi.tilebox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                 amrex::ignore_unused(k);
@@ -558,14 +675,6 @@ class RocheBlock : public AmrCore {
                 const Real x10 = v(i + 1, j, 0, 0), y10 = v(i + 1, j, 0, 1);
                 const Real x11 = v(i + 1, j + 1, 0, 0), y11 = v(i + 1, j + 1, 0, 1);
                 const Real x01 = v(i, j + 1, 0, 0), y01 = v(i, j + 1, 0, 1);
-                // Outward area vectors. The (i, j) -> (x, y) map is
-                // left-handed, so with edges taken in v00->v10->v11->v01
-                // order the outward normal is A = (-ey, ex).
-                const Real Ailo[2] = {y01 - y00, x00 - x01};
-                const Real Ajlo[2] = {y00 - y10, x10 - x00};
-                const Real Aihi[2] = {y10 - y11, x11 - x10};
-                const Real Ajhi[2] = {y11 - y01, x01 - x11};
-
                 Real UL[ncomp];
                 Real UR[ncomp];
                 Real ZL[ncomp];
@@ -577,22 +686,22 @@ class RocheBlock : public AmrCore {
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i - 1, j, k, n); }
                 for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i - 1, j, k, n); }
-                rusanov_flux(UL, UR, ZL, ZR, Ailo[0], Ailo[1], p.cs, F);
+                rusanov_face_flux(UL, UR, ZL, ZR, face_a, i, j, k, ilo, p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i + 1, j, k, n); }
                 for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i + 1, j, k, n); }
-                rusanov_flux(UL, UR, ZL, ZR, Aihi[0], Aihi[1], p.cs, F);
+                rusanov_face_flux(UL, UR, ZL, ZR, face_a, i, j, k, ihi, p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i, j - 1, k, n); }
                 for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i, j - 1, k, n); }
-                rusanov_flux(UL, UR, ZL, ZR, Ajlo[0], Ajlo[1], p.cs, F);
+                rusanov_face_flux(UL, UR, ZL, ZR, face_a, i, j, k, jlo, p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 for (int n = 0; n < ncomp; ++n) { UR[n] = u(i, j + 1, k, n); }
                 for (int n = 0; n < ncomp; ++n) { ZR[n] = u0(i, j + 1, k, n); }
-                rusanov_flux(UL, UR, ZL, ZR, Ajhi[0], Ajhi[1], p.cs, F);
+                rusanov_face_flux(UL, UR, ZL, ZR, face_a, i, j, k, jhi, p.cs, F);
                 for (int n = 0; n < ncomp; ++n) { fsum[n] += F[n]; }
 
                 const Real dtv = dt / vol_a(i, j, k);
@@ -712,31 +821,28 @@ class RocheBlock : public AmrCore {
         for (MFIter mfi(U); mfi.isValid(); ++mfi) {
             const Box& vbx = mfi.validbox();
             Array4<Real const> u = U.const_array(mfi);
-            Array4<Real const> v = xyv.const_array(mfi);
+            Array4<Real const> face_a = faces.const_array(mfi);
             Array4<Real const> vol_a = vol.const_array(mfi);
             reduce_op.eval(vbx, reduce_data,
                            [=] AMREX_GPU_DEVICE(int i, int j, int k) -> ReduceTuple {
                 amrex::ignore_unused(k);
-                const Real x00 = v(i, j, 0, 0),     y00 = v(i, j, 0, 1);
-                const Real x10 = v(i + 1, j, 0, 0), y10 = v(i + 1, j, 0, 1);
-                const Real x11 = v(i + 1, j + 1, 0, 0), y11 = v(i + 1, j + 1, 0, 1);
-                const Real x01 = v(i, j + 1, 0, 0), y01 = v(i, j + 1, 0, 1);
-                const Real Ailo[2] = {y01 - y00, x00 - x01};
-                const Real Ajlo[2] = {y00 - y10, x10 - x00};
-                const Real Aihi[2] = {y10 - y11, x11 - x10};
-                const Real Ajhi[2] = {y11 - y01, x01 - x11};
                 const Real rho = u(i, j, k, URHO);
                 const Real ux = u(i, j, k, UMX) / rho;
                 const Real uy = u(i, j, k, UMY) / rho;
                 Real lam = 0.0_rt;
-                auto acc = [&](Real ax, Real ay) {
-                    lam += std::abs(ux * ax + uy * ay)
-                        + p.cs * std::sqrt(ax * ax + ay * ay);
+                auto acc = [&](FaceDir face) {
+                    Real x, y, dxdt, dydt;
+                    rational_face_point_tangent(face_a, i, j, k, face, 0.5_rt,
+                                                x, y, dxdt, dydt);
+                    const Real length = rational_face_length(face_a, i, j, k, face);
+                    const Real nx = dydt / std::sqrt(dxdt * dxdt + dydt * dydt);
+                    const Real ny = -dxdt / std::sqrt(dxdt * dxdt + dydt * dydt);
+                    lam += (std::abs(ux * nx + uy * ny) + p.cs) * length;
                 };
-                acc(Ailo[0], Ailo[1]);
-                acc(Aihi[0], Aihi[1]);
-                acc(Ajlo[0], Ajlo[1]);
-                acc(Ajhi[0], Ajhi[1]);
+                acc(ilo);
+                acc(ihi);
+                acc(jlo);
+                acc(jhi);
                 return {vol_a(i, j, k) / lam};
             });
         }
@@ -971,6 +1077,8 @@ class RocheBlock : public AmrCore {
     MultiFab Unew{};
     MultiFab Uinit{};  // initial state: the open-boundary reservoir
     MultiFab xyv{};    // physical vertex coordinates, nodal, 2 components
+    MultiFab corners{}; // per-cell P00, P01, P11, P10 coordinate pairs
+    MultiFab faces{};  // per-cell rational quadratic faces, 4 * nfacecomp components
     MultiFab vol{};    // cell volumes
     RocheParams params{};
     BlockGeom g{};
@@ -986,6 +1094,8 @@ class RocheBlock : public AmrCore {
         Unew.define(ba, dm, ncomp, nghost);
         Uinit.define(ba, dm, ncomp, nghost);
         xyv.define(amrex::convert(ba, IntVect{AMREX_D_DECL(1, 1, 1)}), dm, 2, 0);
+        corners.define(ba, dm, ncorners * ncornercomp, 0);
+        faces.define(ba, dm, nfaces * nfacecomp, 0);
         vol.define(ba, dm, 1, 0);
     }
     void MakeNewLevelFromCoarse(int, Real, const ::amrex::BoxArray&,
@@ -1002,6 +1112,8 @@ class RocheBlock : public AmrCore {
         Unew.clear();
         Uinit.clear();
         xyv.clear();
+        corners.clear();
+        faces.clear();
         vol.clear();
     }
 };
